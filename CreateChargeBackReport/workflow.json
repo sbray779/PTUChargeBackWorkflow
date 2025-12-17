@@ -12,7 +12,7 @@
             }
           },
           "method": "post",
-          "body": "ApiManagementGatewayLogs \n| join ApiManagementGatewayLlmLog on CorrelationId\n| where SequenceNumber == 0 and IsRequestSuccess == true\n| mv-expand TraceRecords\n| extend messageRaw = tostring(TraceRecords[\"message\"])\n| extend clientID = trim(\"ClientID:\", messageRaw)\n| project TimeGenerated, clientID, Region, CallerIpAddress, Cache, ProductId, BackendId, PromptTokens, CompletionTokens, TotalTokens, ModelName\n",
+          "body": "ApiManagementGatewayLogs | where TimeGenerated >= ago(24h) | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc",
           "path": "/queryData",
           "queries": {
             "subscriptions": "b5b4a11b-5367-41d2-9ec2-fee75c17c5f9",

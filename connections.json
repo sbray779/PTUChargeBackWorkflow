@@ -1,0 +1,28 @@
+{
+  "managedApiConnections": {
+    "azuremonitorlogs": {
+      "api": {
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/providers/Microsoft.Web/locations/eastus2/managedApis/azuremonitorlogs"
+      },
+      "connection": {
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azuremonitorlogs"
+      },
+      "connectionRuntimeUrl": "https://management.azure.com/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azuremonitorlogs",
+      "authentication": {
+        "type": "ManagedServiceIdentity"
+      }
+    },
+    "azureblob-1": {
+      "api": {
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/providers/Microsoft.Web/locations/eastus2/managedApis/azureblob"
+      },
+      "connection": {
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azureblob-1"
+      },
+      "connectionRuntimeUrl": "https://management.azure.com/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azureblob-1",
+      "authentication": {
+        "type": "ManagedServiceIdentity"
+      }
+    }
+  }
+}
