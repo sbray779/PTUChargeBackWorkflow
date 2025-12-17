@@ -75,6 +75,222 @@ Failures are logged to the `WorkflowFailures_CL` custom table with the following
   - Custom LLM usage logs table
 - **Resource ID Example**: `/subscriptions/{subscription-id}/resourceGroups/{rg-name}/providers/Microsoft.OperationalInsights/workspaces/{workspace-name}`
 
+##### Configuring APIM to Log LLM Usage Data
+
+To enable LLM logging in Azure API Management for OpenAI APIs, you need to:
+1. Configure APIM diagnostic settings to send logs to Log Analytics
+2. Add policies to capture and log LLM token usage data
+3. Verify logs are flowing correctly
+
+**Step 1: Enable APIM Diagnostic Settings**
+
+Configure APIM to send gateway logs to your Log Analytics workspace:
+
+```bash
+# Variables
+APIM_NAME="your-apim-name"
+APIM_RESOURCE_GROUP="your-apim-rg"
+WORKSPACE_ID="/subscriptions/{subscription-id}/resourceGroups/{rg}/providers/Microsoft.OperationalInsights/workspaces/{workspace-name}"
+
+# Create diagnostic setting
+az monitor diagnostic-settings create \
+  --name "send-to-log-analytics" \
+  --resource "/subscriptions/{subscription-id}/resourceGroups/$APIM_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME" \
+  --workspace "$WORKSPACE_ID" \
+  --logs '[{"category":"GatewayLogs","enabled":true,"retentionPolicy":{"enabled":false,"days":0}}]' \
+  --metrics '[{"category":"AllMetrics","enabled":true,"retentionPolicy":{"enabled":false,"days":0}}]'
+```
+
+Or via Azure Portal:
+1. Navigate to your API Management instance
+2. Go to **Diagnostic settings** under Monitoring
+3. Click **+ Add diagnostic setting**
+4. Name: `send-to-log-analytics`
+5. Select: **GatewayLogs** and **AllMetrics**
+6. Destination: Check **Send to Log Analytics workspace**
+7. Select your workspace
+8. Click **Save**
+
+**Step 2: Configure OpenAI API Policy to Log LLM Usage**
+
+Add a custom policy to your OpenAI API in APIM to capture and log token usage, model information, and costs:
+
+```xml
+<policies>
+    <inbound>
+        <base />
+        <!-- Set backend URL for OpenAI -->
+        <set-backend-service base-url="https://YOUR-OPENAI-RESOURCE.openai.azure.com/openai" />
+        
+        <!-- Capture request timestamp -->
+        <set-variable name="requestTimestamp" value="@(DateTime.UtcNow.ToString("o"))" />
+        
+        <!-- Store request body for token calculations if needed -->
+        <set-variable name="requestBody" value="@(context.Request.Body.As<string>(preserveContent: true))" />
+    </inbound>
+    
+    <backend>
+        <base />
+    </backend>
+    
+    <outbound>
+        <base />
+        
+        <!-- Extract usage information from OpenAI response -->
+        <choose>
+            <when condition="@(context.Response.StatusCode == 200)">
+                <set-variable name="responseBody" value="@(context.Response.Body.As<JObject>(preserveContent: true))" />
+                
+                <!-- Extract token usage from response -->
+                <set-variable name="promptTokens" value="@{
+                    var body = context.Variables.GetValueOrDefault<JObject>("responseBody");
+                    return body?["usage"]?["prompt_tokens"]?.ToString() ?? "0";
+                }" />
+                
+                <set-variable name="completionTokens" value="@{
+                    var body = context.Variables.GetValueOrDefault<JObject>("responseBody");
+                    return body?["usage"]?["completion_tokens"]?.ToString() ?? "0";
+                }" />
+                
+                <set-variable name="totalTokens" value="@{
+                    var body = context.Variables.GetValueOrDefault<JObject>("responseBody");
+                    return body?["usage"]?["total_tokens"]?.ToString() ?? "0";
+                }" />
+                
+                <set-variable name="modelName" value="@{
+                    var body = context.Variables.GetValueOrDefault<JObject>("responseBody");
+                    return body?["model"]?.ToString() ?? "unknown";
+                }" />
+                
+                <!-- Log to Application Insights custom event -->
+                <log-to-eventhub logger-id="log-to-eventhub-logger" partition-id="0">@{
+                    return new JObject(
+                        new JProperty("EventTime", context.Variables.GetValueOrDefault<string>("requestTimestamp")),
+                        new JProperty("ServiceName", "OpenAI"),
+                        new JProperty("RequestId", context.RequestId),
+                        new JProperty("SubscriptionId", context.Subscription?.Id ?? "unknown"),
+                        new JProperty("UserId", context.User?.Id ?? "anonymous"),
+                        new JProperty("ApiId", context.Api.Id),
+                        new JProperty("ApiName", context.Api.Name),
+                        new JProperty("OperationId", context.Operation.Id),
+                        new JProperty("OperationName", context.Operation.Name),
+                        new JProperty("ModelName", context.Variables.GetValueOrDefault<string>("modelName")),
+                        new JProperty("PromptTokens", context.Variables.GetValueOrDefault<string>("promptTokens")),
+                        new JProperty("CompletionTokens", context.Variables.GetValueOrDefault<string>("completionTokens")),
+                        new JProperty("TotalTokens", context.Variables.GetValueOrDefault<string>("totalTokens")),
+                        new JProperty("ResponseTime", context.Elapsed.TotalMilliseconds),
+                        new JProperty("StatusCode", context.Response.StatusCode)
+                    ).ToString();
+                }</log-to-eventhub>
+            </when>
+        </choose>
+    </outbound>
+    
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+```
+
+**Alternative: Simplified Policy using Azure Monitor Logger**
+
+If you have an Azure Monitor Application Insights logger configured:
+
+```xml
+<policies>
+    <inbound>
+        <base />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+        <choose>
+            <when condition="@(context.Response.StatusCode == 200)">
+                <azure-openai-emit-token-metric namespace="AzureOpenAI">
+                    <dimension name="API ID" value="@(context.Api.Id)" />
+                    <dimension name="Subscription ID" value="@(context.Subscription.Id)" />
+                    <dimension name="User ID" value="@(context.User.Id)" />
+                </azure-openai-emit-token-metric>
+            </when>
+        </choose>
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+```
+
+**Step 3: Create Custom Logging Table (Alternative to Event Hub)**
+
+For direct logging to Log Analytics, create a custom table and use the emit-metric policy:
+
+```bash
+# Create custom LLM usage table
+az monitor log-analytics workspace table create \
+  --subscription {subscription-id} \
+  --resource-group {resource-group} \
+  --workspace-name {workspace-name} \
+  --name LLMUsage_CL \
+  --retention-time 90 \
+  --columns EventTime=datetime RequestId=string SubscriptionId=string UserId=string \
+            ApiId=string ApiName=string OperationName=string ModelName=string \
+            PromptTokens=int CompletionTokens=int TotalTokens=int \
+            ResponseTime=real StatusCode=int ServiceName=string
+```
+
+**Step 4: Verify Logs are Flowing**
+
+After configuring the above, wait 5-10 minutes and verify logs appear:
+
+```kql
+// Check APIM Gateway Logs
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(1h)
+| where OperationId contains "openai"
+| project TimeGenerated, RequestId, ApiId, OperationId, ResponseCode, ResponseSize
+| take 10
+
+// Check for OpenAI-specific usage data in custom dimensions
+ApiManagementGatewayLogs
+| where TimeGenerated > ago(1h)
+| where ApiId contains "openai" or OperationId contains "chat" or OperationId contains "completion"
+| extend ModelName = tostring(parse_json(BackendResponseBody).model)
+| extend TotalTokens = toint(parse_json(BackendResponseBody).usage.total_tokens)
+| extend PromptTokens = toint(parse_json(BackendResponseBody).usage.prompt_tokens)
+| extend CompletionTokens = toint(parse_json(BackendResponseBody).usage.completion_tokens)
+| where isnotempty(TotalTokens)
+| project TimeGenerated, RequestId, ModelName, PromptTokens, CompletionTokens, TotalTokens
+| take 10
+```
+
+**Step 5: Enable Body Logging (Optional - for detailed debugging)**
+
+⚠️ **Warning**: Logging request/response bodies may expose sensitive data and increase costs.
+
+To enable body logging for detailed token analysis:
+
+1. Go to APIM → **APIs** → Select your OpenAI API
+2. Select **Settings** tab
+3. Under **Diagnostics Logs**:
+   - Enable **Azure Monitor**
+   - Set **Number of payload bytes to log**: 8192
+   - Check **Log headers** and **Log body** (both request and response)
+4. Click **Save**
+
+**Cost Considerations**:
+- Gateway logs: ~$2.99 per GB ingestion
+- Typical OpenAI API call log size: ~5-10 KB
+- 10,000 API calls/month ≈ 50-100 MB ≈ $0.15-$0.30/month
+- Body logging increases size by 3-5x
+
+**Security Note**: If logging bodies, ensure:
+- Proper RBAC on Log Analytics workspace
+- Enable audit logs for data access
+- Consider using workspace transformation to redact sensitive fields
+- Set appropriate retention periods
+
 #### Error Logging Log Analytics Workspace
 - **Purpose**: Stores workflow failure events
 - **Custom Table**: `WorkflowFailures_CL` (created via Data Collection Rules)
