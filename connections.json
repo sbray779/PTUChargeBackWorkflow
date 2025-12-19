@@ -5,24 +5,41 @@
         "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/providers/Microsoft.Web/locations/eastus2/managedApis/azuremonitorlogs"
       },
       "connection": {
-        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azuremonitorlogs"
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/testchargeback/providers/Microsoft.Web/connections/azuremonitorlogs"
       },
-      "connectionRuntimeUrl": "https://management.azure.com/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azuremonitorlogs",
       "authentication": {
         "type": "ManagedServiceIdentity"
+      },
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/801e3f42a7c84c94b1fb512b18708507",
+      "connectionProperties": {
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://management.core.windows.net/",
+          "additionalAudiences": [
+            "https://api.loganalytics.io"
+          ]
+        }
       }
     },
-    "azureblob-1": {
+    "azureblob": {
       "api": {
         "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/providers/Microsoft.Web/locations/eastus2/managedApis/azureblob"
       },
       "connection": {
-        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azureblob-1"
+        "id": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/testchargeback/providers/Microsoft.Web/connections/azureblob"
       },
-      "connectionRuntimeUrl": "https://management.azure.com/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.Web/connections/azureblob-1",
       "authentication": {
         "type": "ManagedServiceIdentity"
+      },
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/1c79d12bcfff4c0dabd9057acf97290c",
+      "connectionProperties": {
+        "authentication": {
+          "type": "ManagedServiceIdentity",
+          "audience": "https://storage.azure.com/"
+        }
       }
     }
-  }
+  },
+  "serviceProviderConnections": {},
+  "agentConnections": {}
 }

@@ -2,6 +2,17 @@
   "definition": {
     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
     "contentVersion": "1.0.0.0",
+    "triggers": {
+      "Recurrence": {
+        "type": "Recurrence",
+        "description": "Trigger generation of report daily",
+        "recurrence": {
+          "interval": 24,
+          "frequency": "Hour",
+          "timeZone": "Central Standard Time"
+        }
+      }
+    },
     "actions": {
       "Run_query_and_list_results": {
         "type": "ApiConnection",
@@ -16,13 +27,44 @@
           "path": "/queryData",
           "queries": {
             "subscriptions": "b5b4a11b-5367-41d2-9ec2-fee75c17c5f9",
-            "resourcegroups": "aihubchargeback",
+            "resourcegroups": "AIHubChargeBack",
             "resourcetype": "Log Analytics Workspace",
             "resourcename": "ChargeBackWorkspace",
-            "timerange": "Last 24 hours"
+            "timerange": "Set in query"
           }
         },
         "runAfter": {}
+      },
+      "Create_blob_(V2)": {
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "referenceName": "azureblob"
+            }
+          },
+          "method": "post",
+          "body": "@body('Create_CSV_table')",
+          "headers": {
+            "ReadFileMetadataFromServer": true
+          },
+          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('https://rptcbeuafktc4lcygi.blob.core.windows.net/'))}/files",
+          "queries": {
+            "folderPath": "reportoutput",
+            "name": "dailyChargeBackReport.csv",
+            "queryParametersSingleEncoded": true
+          }
+        },
+        "runAfter": {
+          "Create_CSV_table": [
+            "Succeeded"
+          ]
+        },
+        "runtimeConfiguration": {
+          "contentTransfer": {
+            "transferMode": "Chunked"
+          }
+        }
       },
       "Create_CSV_table": {
         "type": "Table",
@@ -32,52 +74,17 @@
         },
         "runAfter": {
           "Run_query_and_list_results": [
-            "SUCCEEDED"
+            "Succeeded"
           ]
-        }
-      },
-      "Create_blob_(V2)": {
-        "type": "ApiConnection",
-        "inputs": {
-          "host": {
-            "connection": {
-              "referenceName": "azureblob-1"
-            }
-          },
-          "method": "post",
-          "body": "@body('Create_CSV_table')",
-          "headers": {
-            "ReadFileMetadataFromServer": true
-          },
-          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('https://aicbgeklcxhvw3ilgu2.blob.core.windows.net/'))}/files",
-          "queries": {
-            "folderPath": "reportoutput",
-            "name": "dailyChargeBackReport.csv",
-            "queryParametersSingleEncoded": true
-          }
-        },
-        "runAfter": {
-          "Create_CSV_table": [
-            "SUCCEEDED"
-          ]
-        },
-        "runtimeConfiguration": {
-          "contentTransfer": {
-            "transferMode": "Chunked"
-          }
         }
       },
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
+          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
-          "uri": "https://dce-workflowerrors-bjr6.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-0b1e7503c5ac40508cf645e28fd4b7a0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "headers": {
             "Content-Type": "application/json"
-          },
-          "authentication": {
-            "type": "ManagedServiceIdentity",
-            "audience": "https://monitor.azure.com"
           },
           "body": [
             {
@@ -91,27 +98,27 @@
               "Severity": "High",
               "BlobPath": ""
             }
-          ]
+          ],
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://monitor.azure.com"
+          }
         },
         "runAfter": {
           "Run_query_and_list_results": [
-            "FAILED",
-            "TIMEDOUT",
-            "SKIPPED"
+            "TimedOut",
+            "Skipped",
+            "Failed"
           ]
         }
       },
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
+          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
-          "uri": "https://dce-workflowerrors-bjr6.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-0b1e7503c5ac40508cf645e28fd4b7a0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "headers": {
             "Content-Type": "application/json"
-          },
-          "authentication": {
-            "type": "ManagedServiceIdentity",
-            "audience": "https://monitor.azure.com"
           },
           "body": [
             {
@@ -125,30 +132,29 @@
               "ErrorMessage": "@{actions('Create_blob_(V2)')?['error']?['message']}",
               "Severity": "High"
             }
-          ]
+          ],
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "audience": "https://monitor.azure.com"
+          }
         },
         "runAfter": {
           "Create_blob_(V2)": [
-            "FAILED",
-            "TIMEDOUT",
-            "SKIPPED"
+            "TimedOut",
+            "Skipped",
+            "Failed"
           ]
         }
       }
     },
-    "outputs": {},
-    "triggers": {
-      "Recurrence": {
-        "type": "Recurrence",
-        "description": "Schedule to kick off chargeback report creation daily",
-        "recurrence": {
-          "interval": 1,
-          "frequency": "Day",
-          "timeZone": "Central Standard Time",
-          "startTime": "2025-10-10T12:00:00Z"
-        }
-      }
-    }
+    "outputs": {}
   },
-  "kind": "Stateful"
+  "kind": "stateful"
 }
+
+
+
+
+
+
+
