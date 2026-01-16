@@ -133,6 +133,22 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'APP_KIND'
           value: 'workflowApp'
         }
+        {
+          name: 'WORKFLOWS_SUBSCRIPTION_ID'
+          value: subscription().subscriptionId
+        }
+        {
+          name: 'WORKFLOWS_LOCATION_NAME'
+          value: location
+        }
+        {
+          name: 'WORKFLOWS_RESOURCE_GROUP_NAME'
+          value: resourceGroupName
+        }
+        {
+          name: 'REPORT_STORAGE_ACCOUNT_NAME'
+          value: reportStorage.name
+        }
       ]
       netFrameworkVersion: 'v6.0'
       use32BitWorkerProcess: false
@@ -258,6 +274,16 @@ resource dceRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' 
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
     principalId: logicApp.identity.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+
+// RBAC: Log Analytics Reader on source workspace for Logic App (cross-resource-group)
+module sourceWorkspaceRbac 'modules/logAnalyticsRbac.bicep' = {
+  name: 'sourceWorkspaceRbac'
+  scope: resourceGroup(sourceWorkspaceResourceGroup)
+  params: {
+    workspaceName: sourceLogAnalyticsWorkspace
+    principalId: logicApp.identity.principalId
   }
 }
 

@@ -48,7 +48,7 @@
           "headers": {
             "ReadFileMetadataFromServer": true
           },
-          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent('https://rptcbeuafktc4lcygi.blob.core.windows.net/'))}/files",
+          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
           "queries": {
             "folderPath": "reportoutput",
             "name": "dailyChargeBackReport.csv",
@@ -151,6 +151,11 @@
   },
   "kind": "stateful"
 }
+
+
+
+
+
 
 
 

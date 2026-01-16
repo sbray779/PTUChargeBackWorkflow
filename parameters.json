@@ -1,0 +1,22 @@
+{
+  "azuremonitorlogs-ConnectionRuntimeUrl": {
+    "type": "String",
+    "value": "@appsetting('azuremonitorlogs-ConnectionRuntimeUrl')"
+  },
+  "azuremonitorlogs-Authentication": {
+    "type": "Object",
+    "value": {
+      "type": "ManagedServiceIdentity"
+    }
+  },
+  "azureblob-ConnectionRuntimeUrl": {
+    "type": "String",
+    "value": "@appsetting('azureblob-ConnectionRuntimeUrl')"
+  },
+  "azureblob-Authentication": {
+    "type": "Object",
+    "value": {
+      "type": "ManagedServiceIdentity"
+    }
+  }
+}
