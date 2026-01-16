@@ -42,18 +42,24 @@ The deployed workflow:
 ## Deployment
 
 ### Step 1: Configure Parameters
-### Ensure that the sourceLogAnalyticsWorkspace and sourceWorkspaceResourceGroup parameters point to 
-### the existing log analytics workspace to which LLM logs are being sent from the APIM AI Gateway
-Edit the `deploy-infrastructure.bicepparam` file:
+
+Edit the `deploy-infrastructure.bicepparam` file and replace the placeholder values with your environment-specific settings:
 
 ```bicep
 using './deploy-infrastructure.bicep'
 
-param resourceGroupName = 'rg-chargeback-prod'
-param location = 'eastus2'
-param sourceLogAnalyticsWorkspace = 'MyLLMLogsWorkspace'
-param sourceWorkspaceResourceGroup = 'MyLLMLogsWorkspace-RG'
+param resourceGroupName = '<YOUR_RESOURCE_GROUP_NAME>'
+param location = '<YOUR_AZURE_REGION>'
+param sourceLogAnalyticsWorkspace = '<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>'
+param sourceWorkspaceResourceGroup = '<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>'
 ```
+
+| Placeholder | Description | Example |
+|-------------|-------------|---------|
+| `<YOUR_RESOURCE_GROUP_NAME>` | Target resource group where the Logic App and supporting resources will be deployed | `rg-chargeback-prod` |
+| `<YOUR_AZURE_REGION>` | Azure region for deployment | `eastus2`, `westus2`, `centralus` |
+| `<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>` | Name of the existing Log Analytics workspace containing `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables from your APIM AI Gateway | `MyLLMLogsWorkspace` |
+| `<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>` | Resource group containing the source Log Analytics workspace | `MyLLMLogsResourceGroup` |
 
 ### Step 2: Run Deployment Script
 

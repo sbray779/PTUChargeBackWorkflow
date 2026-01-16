@@ -1,6 +1,6 @@
 using './deploy-infrastructure.bicep'
 
-param resourceGroupName = 'testchargeback'
-param location = 'eastus2'
-param sourceLogAnalyticsWorkspace = 'ChargeBackWorkspace'
-param sourceWorkspaceResourceGroup = 'AIHubChargeBack'
+param resourceGroupName = '<YOUR_RESOURCE_GROUP_NAME>'
+param location = '<YOUR_AZURE_REGION>'
+param sourceLogAnalyticsWorkspace = '<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>'
+param sourceWorkspaceResourceGroup = '<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>'
