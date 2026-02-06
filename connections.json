@@ -7,11 +7,15 @@
       "connection": {
         "id": "/subscriptions/@{appsetting('WORKFLOWS_SUBSCRIPTION_ID')}/resourceGroups/@{appsetting('WORKFLOWS_RESOURCE_GROUP_NAME')}/providers/Microsoft.Web/connections/azuremonitorlogs"
       },
-      "authentication": "@parameters('azuremonitorlogs-Authentication')",
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/c4a2c087f12246a68887194937acfb54",
+      "authentication": {
+        "type": "ManagedServiceIdentity",
+        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc"
+      },
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/13e66a34ae174446a3e0a438e41cb2f7",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
+          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
           "audience": "https://management.core.windows.net/",
           "additionalAudiences": [
             "https://api.loganalytics.io"
@@ -26,11 +30,15 @@
       "connection": {
         "id": "/subscriptions/@{appsetting('WORKFLOWS_SUBSCRIPTION_ID')}/resourceGroups/@{appsetting('WORKFLOWS_RESOURCE_GROUP_NAME')}/providers/Microsoft.Web/connections/azureblob"
       },
-      "authentication": "@parameters('azureblob-Authentication')",
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/9fe65ff396b04f5aaf88b4b86c5ed211",
+      "authentication": {
+        "type": "ManagedServiceIdentity",
+        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc"
+      },
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/a779dc73781441819a15ba78da114f54",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
+          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
           "audience": "https://storage.azure.com/"
         }
       }

@@ -14,7 +14,8 @@ By default, the workflow is triggered daily.
 ## Overview
 
 The solution uses **Bicep templates** and **PowerShell** to deploy a complete infrastructure including:
-- **Logic App (Standard)** - Workflow engine with system-assigned managed identity
+- **Logic App (Standard)** - Workflow engine with user-assigned managed identity
+- **User-Assigned Managed Identity** - Centrally managed identity for all authentication
 - **API Connections** - Azure Monitor Logs and Azure Blob Storage (V2) with managed identity authentication
 - **Storage Accounts** - Separate accounts for Logic App internal storage and report output
 - **Log Analytics Workspace** - Error logging and monitoring
@@ -28,7 +29,7 @@ The deployed workflow:
 2. **Aggregates data** by ProductId and ModelName with token counts, call counts, and metadata (regions, IPs, caches, backends)
 3. **Generates CSV report** and uploads to blob storage container
 4. **Error Handling** - Logs query failures and blob write failures to custom Log Analytics table via Data Collection Rules
-5. **Managed Identity** - All authentication uses system-assigned managed identity (no keys/secrets)
+5. **User-Assigned Managed Identity** - All authentication uses a centrally managed user-assigned identity (no keys/secrets)
 
 ## Prerequisites
 
@@ -91,32 +92,35 @@ The script will automatically:
 ### Infrastructure Resources (via Bicep)
 
 1. **App Service Plan** - `asp-chargeback-{uniqueSuffix}` (WS1 SKU for Logic Apps)
-2. **Logic App** - `logic-chargeback-{uniqueSuffix}` with system-assigned managed identity
-3. **Logic App Storage Account** - `lacb{uniqueSuffix}` with key-based auth (required for Logic App runtime)
-4. **File Share** - Created in Logic App storage for internal operations
-5. **Report Storage Account** - `rptcb{uniqueSuffix}` with managed identity only (no keys)
-6. **Blob Container** - `reportoutput` in report storage for CSV files
-7. **Log Analytics Workspace** - `law-chargeback-{uniqueSuffix}` for error logging
-8. **Custom Log Table** - `WorkflowFailures_CL` with schema for error tracking
-9. **Data Collection Endpoint** - `dce-chargeback-{uniqueSuffix}` for log ingestion
-10. **Data Collection Rule** - `dcr-chargeback-{uniqueSuffix}` routes errors to custom table
+2. **User-Assigned Managed Identity** - `id-chargeback-{uniqueSuffix}` for centralized authentication
+3. **Logic App** - `logic-chargeback-{uniqueSuffix}` configured with user-assigned managed identity
+4. **Logic App Storage Account** - `lacb{uniqueSuffix}` with key-based auth (required for Logic App runtime)
+5. **File Share** - Created in Logic App storage for internal operations
+6. **Report Storage Account** - `rptcb{uniqueSuffix}` with managed identity only (no keys)
+7. **Blob Container** - `reportoutput` in report storage for CSV files
+8. **Log Analytics Workspace** - `law-chargeback-{uniqueSuffix}` for error logging
+9. **Custom Log Table** - `WorkflowFailures_CL` with schema for error tracking
+10. **Data Collection Endpoint** - `dce-chargeback-{uniqueSuffix}` for log ingestion
+11. **Data Collection Rule** - `dcr-chargeback-{uniqueSuffix}` routes errors to custom table
 
 ### API Connections (via PowerShell)
 
 - **azuremonitorlogs** - V2 connection with managed identity authentication
 - **azureblob** - V2 connection with managed identity authentication
-- Both connections configured with access policies granting Logic App identity access
+- Both connections configured with access policies granting user-assigned managed identity access
 
 ### RBAC Role Assignments
+
+All RBAC roles are assigned to the **user-assigned managed identity** (`id-chargeback-{uniqueSuffix}`):
 
 | Role | Scope | Purpose | Assigned By |
 |------|-------|---------|-------------|
 | Storage Blob Data Contributor | Report storage account | Write CSV reports | Bicep |
 | Monitoring Metrics Publisher | Data Collection Rule | Ingest error logs | Bicep |
 | Monitoring Metrics Publisher | Data Collection Endpoint | Send logs to DCE | Bicep |
+| Log Analytics Reader | Source workspace | Query LLM logs | Bicep |
 | Website Contributor | Logic App resource | Dynamic schema retrieval | PowerShell |
 | Reader | Source workspace | Read workspace metadata | PowerShell |
-| Log Analytics Reader | Source workspace | Query LLM logs | PowerShell |
 
 ## Architecture
 
@@ -125,12 +129,18 @@ The script will automatically:
 │ Resource Group: rg-chargeback-prod                              │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
+│  ┌──────────────────┐                                          │
+│  │  User-Assigned   │◀─── Used by Logic App & API Connections  │
+│  │ Managed Identity │                                          │
+│  │  (id-chargeback) │                                          │
+│  └────────┬─────────┘                                          │
+│           │                                                     │
+│           ▼                                                     │
 │  ┌──────────────────┐         ┌──────────────────┐            │
 │  │   Logic App      │────────▶│  API Connection  │            │
 │  │   (Standard)     │         │  azuremonitorlogs│            │
 │  └────────┬─────────┘         └────────┬─────────┘            │
 │           │                            │                       │
-│           │ Managed Identity           │                       │
 │           │                            ▼                       │
 │           │                   ┌─────────────────────┐         │
 │           │                   │ Source Log Analytics│         │
@@ -247,10 +257,11 @@ WorkflowFailures_CL
 ### Connection Errors
 
 If connections show as "Invalid" or "Forbidden":
-1. Verify Logic App has system-assigned managed identity enabled in Azure Portal
-2. Check RBAC role assignments are properly configured
-3. Wait 30-60 seconds for permissions to propagate
-4. Restart the Logic App to refresh identity token:
+1. Verify Logic App has user-assigned managed identity configured in Azure Portal
+2. Check that the user-assigned managed identity resource exists: `id-chargeback-{uniqueSuffix}`
+3. Verify RBAC role assignments are properly configured on the managed identity
+4. Wait 30-60 seconds for permissions to propagate
+5. Restart the Logic App to refresh identity token:
    ```powershell
    az logicapp restart --name logic-chargeback-{uniqueSuffix} --resource-group rg-chargeback-prod
    ```
@@ -330,15 +341,17 @@ LogicApp/
 
 ## Important Notes
 
-1. **connections.json in .funcignore**: The `connections.json` file is excluded from deployment. Connections are created in the portal after workflow deployment.
+1. **User-Assigned Managed Identity**: The solution uses a user-assigned managed identity (`id-chargeback-{uniqueSuffix}`) instead of system-assigned. This provides better lifecycle management and allows the identity to persist independently of the Logic App.
 
-2. **Identity Token Refresh**: After deployment, the Logic App is restarted automatically to refresh the managed identity token and pick up new RBAC assignments.
+2. **connections.json Updates**: The `connections.json` file is updated during deployment with the actual user-managed identity resource ID and connection runtime URLs.
 
-3. **Resource Naming**: Resource names include random suffixes to ensure uniqueness across Azure.
+3. **Identity Token Refresh**: After deployment, the Logic App is restarted automatically to refresh the managed identity token and pick up new RBAC assignments.
 
-4. **Connection Names**: API connections are named `azuremonitorlogs` and `azureblob` (without suffixes) to match workflow references.
+4. **Resource Naming**: Resource names include random suffixes to ensure uniqueness across Azure.
 
-5. **DCR/DCE URLs**: Error handling URIs are updated automatically during deployment with the newly created DCR/DCE details.
+5. **Connection Names**: API connections are named `azuremonitorlogs` and `azureblob` (without suffixes) to match workflow references.
+
+6. **DCR/DCE URLs**: Error handling URIs are updated automatically during deployment with the newly created DCR/DCE details.
 
 ## License
 

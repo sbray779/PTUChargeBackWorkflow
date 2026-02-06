@@ -112,7 +112,9 @@ if ($LASTEXITCODE -ne 0 -or -not $deploymentOutput) {
 }
 
 # Extract outputs from deployment
-$logicAppIdentity = $deploymentOutput.properties.outputs.logicAppIdentity.value
+$userManagedIdentityId = $deploymentOutput.properties.outputs.userManagedIdentityId.value
+$userManagedIdentityName = $deploymentOutput.properties.outputs.userManagedIdentityName.value
+$userManagedIdentityPrincipalId = $deploymentOutput.properties.outputs.userManagedIdentityPrincipalId.value
 $LogicAppName = $deploymentOutput.properties.outputs.logicAppName.value
 $logicAppStorageAccountName = $deploymentOutput.properties.outputs.logicAppStorageAccountName.value
 $reportStorageAccountName = $deploymentOutput.properties.outputs.reportStorageAccountName.value
@@ -122,7 +124,8 @@ $errorWorkspaceName = $deploymentOutput.properties.outputs.errorWorkspaceName.va
 
 Write-Host "✓ Infrastructure deployed successfully" -ForegroundColor Green
 Write-Host "  Logic App: $LogicAppName" -ForegroundColor Gray
-Write-Host "  Managed Identity: $logicAppIdentity" -ForegroundColor Gray
+Write-Host "  User Managed Identity: $userManagedIdentityName" -ForegroundColor Gray
+Write-Host "  User Managed Identity Principal ID: $userManagedIdentityPrincipalId" -ForegroundColor Gray
 Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor Gray
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor Gray
 Write-Host "  DCE Endpoint: $dceEndpoint" -ForegroundColor Gray
@@ -171,7 +174,7 @@ $azureMonitorLogsAccessPolicyBody = @{
             type = "ActiveDirectory"
             identity = @{
                 tenantId = $tenantId
-                objectId = $logicAppIdentity
+                objectId = $userManagedIdentityPrincipalId
             }
         }
     }
@@ -181,7 +184,7 @@ $tempFile = [System.IO.Path]::GetTempFileName()
 $azureMonitorLogsAccessPolicyBody | ConvertTo-Json -Depth 10 | Set-Content $tempFile -Encoding UTF8
 
 $result = az rest --method PUT `
-    --uri "/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/connections/azuremonitorlogs/accessPolicies/$logicAppIdentity`?api-version=2018-07-01-preview" `
+    --uri "/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/connections/azuremonitorlogs/accessPolicies/$userManagedIdentityPrincipalId`?api-version=2018-07-01-preview" `
     --headers "Content-Type=application/json" `
     --body "@$tempFile" 2>&1
 
@@ -246,7 +249,7 @@ $azureBlobAccessPolicyBody = @{
             type = "ActiveDirectory"
             identity = @{
                 tenantId = $tenantId
-                objectId = $logicAppIdentity
+                objectId = $userManagedIdentityPrincipalId
             }
         }
     }
@@ -256,7 +259,7 @@ $tempFile = [System.IO.Path]::GetTempFileName()
 $azureBlobAccessPolicyBody | ConvertTo-Json -Depth 10 | Set-Content $tempFile -Encoding UTF8
 
 $result = az rest --method PUT `
-    --uri "/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/connections/azureblob/accessPolicies/$logicAppIdentity`?api-version=2018-07-01-preview" `
+    --uri "/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/connections/azureblob/accessPolicies/$userManagedIdentityPrincipalId`?api-version=2018-07-01-preview" `
     --headers "Content-Type=application/json" `
     --body "@$tempFile" 2>&1
 
@@ -304,7 +307,7 @@ Write-Host "`nStep 5: Assigning RBAC roles..." -ForegroundColor Cyan
 # Website Contributor on the Logic App itself for dynamic schema retrieval
 Write-Host "  Assigning Website Contributor on Logic App..." -ForegroundColor Gray
 az role assignment create `
-    --assignee $logicAppIdentity `
+    --assignee $userManagedIdentityPrincipalId `
     --role "Website Contributor" `
     --scope "/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$LogicAppName" `
     --output none 2>$null
@@ -318,7 +321,7 @@ if ($LASTEXITCODE -eq 0) {
 # Log Analytics Reader on source workspace
 Write-Host "  Assigning Log Analytics Reader on source workspace..." -ForegroundColor Gray
 az role assignment create `
-    --assignee $logicAppIdentity `
+    --assignee $userManagedIdentityPrincipalId `
     --role "Log Analytics Reader" `
     --scope "/subscriptions/$subscription/resourceGroups/$SourceWorkspaceResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$SourceLogAnalyticsWorkspace" `
     --output none 2>$null
@@ -332,7 +335,7 @@ if ($LASTEXITCODE -eq 0) {
 # Reader on source workspace for resource metadata access
 Write-Host "  Assigning Reader on source workspace resource..." -ForegroundColor Gray
 az role assignment create `
-    --assignee $logicAppIdentity `
+    --assignee $userManagedIdentityPrincipalId `
     --role "Reader" `
     --scope "/subscriptions/$subscription/resourceGroups/$SourceWorkspaceResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$SourceLogAnalyticsWorkspace" `
     --output none 2>$null
@@ -361,7 +364,8 @@ $workflowContent = $workflowContent `
     -replace '{{SOURCE_WORKSPACE_RG}}', $SourceWorkspaceResourceGroup `
     -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
     -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
-    -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId
+    -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
+    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId
 
 $workflowContent | Set-Content $workflowPath -Encoding UTF8
 
@@ -373,14 +377,11 @@ $connectionsContent = Get-Content $connectionsPath -Raw
 $connectionsContent = $connectionsContent `
     -replace '{{SUBSCRIPTION_ID}}', $subscription `
     -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
-    -replace '{{LOCATION}}', $Location.ToLower()
+    -replace '{{LOCATION}}', $Location.ToLower() `
+    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
+    -replace '{{AZURE_MONITOR_LOGS_RUNTIME_URL}}', $azureMonitorLogsRuntimeUrl `
+    -replace '{{AZURE_BLOB_RUNTIME_URL}}', $azureBlobRuntimeUrl
 
-# Replace connection runtime URLs with actual values from Azure
-$connectionsJson = $connectionsContent | ConvertFrom-Json
-$connectionsJson.managedApiConnections.azuremonitorlogs.connectionRuntimeUrl = $azureMonitorLogsRuntimeUrl
-$connectionsJson.managedApiConnections.azureblob.connectionRuntimeUrl = $azureBlobRuntimeUrl
-
-$connectionsContent = $connectionsJson | ConvertTo-Json -Depth 10
 $connectionsContent | Set-Content $connectionsPath -Encoding UTF8
 
 Write-Host "✓ Workflow and connections updated" -ForegroundColor Green
@@ -399,7 +400,8 @@ Write-Host "`n=== Deployment Complete ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "Resource Summary:" -ForegroundColor Cyan
 Write-Host "  Logic App: $LogicAppName" -ForegroundColor White
-Write-Host "  Managed Identity: $logicAppIdentity" -ForegroundColor White
+Write-Host "  User Managed Identity: $userManagedIdentityName" -ForegroundColor White
+Write-Host "  User Managed Identity Principal ID: $userManagedIdentityPrincipalId" -ForegroundColor White
 Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor White
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor White
 Write-Host "  Error Workspace: $errorWorkspaceName" -ForegroundColor White

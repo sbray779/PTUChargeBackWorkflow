@@ -27,9 +27,9 @@
           "path": "/queryData",
           "queries": {
             "subscriptions": "b5b4a11b-5367-41d2-9ec2-fee75c17c5f9",
-            "resourcegroups": "AIHubChargeBack",
+            "resourcegroups": "APIMLogging",
             "resourcetype": "Log Analytics Workspace",
-            "resourcename": "ChargeBackWorkspace",
+            "resourcename": "apimloggingla",
             "timerange": "Set in query"
           }
         },
@@ -81,7 +81,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-d6ykwz2sbdjzc-kf1l.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-43af8b9374994d12bbca77c353ec67fb/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -101,6 +101,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -115,7 +116,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-d6ykwz2sbdjzc-kf1l.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-43af8b9374994d12bbca77c353ec67fb/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -135,6 +136,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -151,6 +153,9 @@
   },
   "kind": "stateful"
 }
+
+
+
 
 
 
