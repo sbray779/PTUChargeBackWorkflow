@@ -14,26 +14,168 @@
       }
     },
     "actions": {
-      "Run_query_and_list_results": {
-        "type": "ApiConnection",
+      "Submit_Async_Query": {
+        "type": "Http",
+        "description": "Submit the Log Analytics query asynchronously using Prefer: wait=0 to avoid HTTP timeout on long-running queries.",
         "inputs": {
-          "host": {
-            "connection": {
-              "referenceName": "azuremonitorlogs"
-            }
+          "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('LOG_ANALYTICS_WORKSPACE_ID')}/query",
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json",
+            "Prefer": "wait=0"
           },
-          "method": "post",
-          "body": "ApiManagementGatewayLogs | where TimeGenerated >= ago(24h) | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc",
-          "path": "/queryData",
-          "queries": {
-            "subscriptions": "b5b4a11b-5367-41d2-9ec2-fee75c17c5f9",
-            "resourcegroups": "AIHubChargeBack",
-            "resourcetype": "Log Analytics Workspace",
-            "resourcename": "ChargeBackWorkspace",
-            "timerange": "Set in query"
+          "body": {
+            "query": "ApiManagementGatewayLogs | where TimeGenerated >= ago(24h) | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc"
+          },
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "audience": "https://api.loganalytics.io"
           }
         },
-        "runAfter": {}
+        "runAfter": {},
+        "runtimeConfiguration": {
+          "contentTransfer": {
+            "transferMode": "Chunked"
+          }
+        }
+      },
+      "Check_If_Query_Completed_Synchronously": {
+        "type": "If",
+        "description": "If the API returned 200, the query completed synchronously — skip polling. If 202, we need to poll.",
+        "expression": {
+          "and": [
+            {
+              "equals": [
+                "@outputs('Submit_Async_Query')['statusCode']",
+                200
+              ]
+            }
+          ]
+        },
+        "actions": {
+          "Set_Sync_Results": {
+            "type": "Compose",
+            "inputs": "@body('Submit_Async_Query')"
+          }
+        },
+        "else": {
+          "actions": {
+            "Initialize_Poll_Location": {
+              "type": "Compose",
+              "description": "Capture the Location header URL returned by the 202 response for polling.",
+              "inputs": "@outputs('Submit_Async_Query')['headers']?['location']",
+              "runAfter": {}
+            },
+            "Wait_Before_First_Poll": {
+              "type": "Wait",
+              "inputs": {
+                "interval": {
+                  "count": 10,
+                  "unit": "Second"
+                }
+              },
+              "runAfter": {
+                "Initialize_Poll_Location": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Poll_For_Query_Results": {
+              "type": "Until",
+              "description": "Poll the Location URL until the query completes (status 200) or we exceed the timeout.",
+              "expression": "@equals(outputs('Check_Query_Status')['statusCode'], 200)",
+              "limit": {
+                "count": 60,
+                "timeout": "PT30M"
+              },
+              "actions": {
+                "Check_Query_Status": {
+                  "type": "Http",
+                  "inputs": {
+                    "uri": "@{outputs('Initialize_Poll_Location')}",
+                    "method": "GET",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                      "audience": "https://api.loganalytics.io"
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Delay_Between_Polls": {
+                  "type": "Wait",
+                  "inputs": {
+                    "interval": {
+                      "count": 15,
+                      "unit": "Second"
+                    }
+                  },
+                  "runAfter": {
+                    "Check_Query_Status": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Wait_Before_First_Poll": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Set_Async_Results": {
+              "type": "Compose",
+              "inputs": "@body('Check_Query_Status')",
+              "runAfter": {
+                "Poll_For_Query_Results": [
+                  "Succeeded"
+                ]
+              }
+            }
+          }
+        },
+        "runAfter": {
+          "Submit_Async_Query": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Transform_Query_Results_To_Rows": {
+        "type": "Select",
+        "description": "Transform the Log Analytics columnar response into named objects. Column order matches the KQL project clause: ProductId(0), ModelName(1), PromptTokens(2), CompletionTokens(3), TotalTokens(4), Calls(5), FirstSeen(6), LastSeen(7), Regions(8), CallerIpAddresses(9), Caches(10), BackendIds(11).",
+        "inputs": {
+          "from": "@outputs('Merge_Query_Results')?['tables']?[0]?['rows']",
+          "select": {
+            "ProductId": "@item()[0]",
+            "ModelName": "@item()[1]",
+            "PromptTokens": "@item()[2]",
+            "CompletionTokens": "@item()[3]",
+            "TotalTokens": "@item()[4]",
+            "Calls": "@item()[5]",
+            "FirstSeen": "@item()[6]",
+            "LastSeen": "@item()[7]",
+            "Regions": "@item()[8]",
+            "CallerIpAddresses": "@item()[9]",
+            "Caches": "@item()[10]",
+            "BackendIds": "@item()[11]"
+          }
+        },
+        "runAfter": {
+          "Merge_Query_Results": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Merge_Query_Results": {
+        "type": "Compose",
+        "description": "Select the final query result body, whether it came from the synchronous or asynchronous path.",
+        "inputs": "@if(equals(outputs('Submit_Async_Query')['statusCode'], 200), outputs('Set_Sync_Results'), outputs('Set_Async_Results'))",
+        "runAfter": {
+          "Check_If_Query_Completed_Synchronously": [
+            "Succeeded"
+          ]
+        }
       },
       "Create_blob_(V2)": {
         "type": "ApiConnection",
@@ -69,11 +211,11 @@
       "Create_CSV_table": {
         "type": "Table",
         "inputs": {
-          "from": "@body('Run_query_and_list_results')?['value']",
+          "from": "@body('Transform_Query_Results_To_Rows')",
           "format": "CSV"
         },
         "runAfter": {
-          "Run_query_and_list_results": [
+          "Transform_Query_Results_To_Rows": [
             "Succeeded"
           ]
         }
@@ -81,7 +223,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -92,22 +234,26 @@
               "WorkflowName": "@{workflow().name}",
               "WorkflowRunId": "@{workflow().run.id}",
               "FailureType": "QueryFailure",
-              "ActionName": "Run_query_and_list_results",
-              "ErrorCode": "@{actions('Run_query_and_list_results')?['error']?['code']}",
-              "ErrorMessage": "@{actions('Run_query_and_list_results')?['error']?['message']}",
+              "ActionName": "Submit_Async_Query",
+              "ErrorCode": "@{coalesce(actions('Submit_Async_Query')?['error']?['code'], actions('Check_Query_Status')?['error']?['code'], 'Unknown')}",
+              "ErrorMessage": "@{coalesce(actions('Submit_Async_Query')?['error']?['message'], actions('Check_Query_Status')?['error']?['message'], 'Query failed or timed out during async execution')}",
               "Severity": "High",
               "BlobPath": ""
             }
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
         "runAfter": {
-          "Run_query_and_list_results": [
+          "Submit_Async_Query": [
             "TimedOut",
-            "Skipped",
+            "Failed"
+          ],
+          "Check_If_Query_Completed_Synchronously": [
+            "TimedOut",
             "Failed"
           ]
         }
@@ -115,7 +261,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-euafktc4lcygi-fw6g.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-2c42beaabe044ef1af3d7421a5b36771/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -135,6 +281,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -151,6 +298,12 @@
   },
   "kind": "stateful"
 }
+
+
+
+
+
+
 
 
 

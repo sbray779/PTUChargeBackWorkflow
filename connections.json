@@ -7,11 +7,15 @@
       "connection": {
         "id": "/subscriptions/@{appsetting('WORKFLOWS_SUBSCRIPTION_ID')}/resourceGroups/@{appsetting('WORKFLOWS_RESOURCE_GROUP_NAME')}/providers/Microsoft.Web/connections/azuremonitorlogs"
       },
-      "authentication": "@parameters('azuremonitorlogs-Authentication')",
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/c4a2c087f12246a68887194937acfb54",
+      "authentication": {
+        "type": "ManagedServiceIdentity",
+        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
+      },
+      "connectionRuntimeUrl": "{{AZURE_MONITOR_LOGS_RUNTIME_URL}}",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
+          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
           "audience": "https://management.core.windows.net/",
           "additionalAudiences": [
             "https://api.loganalytics.io"
@@ -26,11 +30,15 @@
       "connection": {
         "id": "/subscriptions/@{appsetting('WORKFLOWS_SUBSCRIPTION_ID')}/resourceGroups/@{appsetting('WORKFLOWS_RESOURCE_GROUP_NAME')}/providers/Microsoft.Web/connections/azureblob"
       },
-      "authentication": "@parameters('azureblob-Authentication')",
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/9fe65ff396b04f5aaf88b4b86c5ed211",
+      "authentication": {
+        "type": "ManagedServiceIdentity",
+        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
+      },
+      "connectionRuntimeUrl": "{{AZURE_BLOB_RUNTIME_URL}}",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
+          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
           "audience": "https://storage.azure.com/"
         }
       }
@@ -39,3 +47,6 @@
   "serviceProviderConnections": {},
   "agentConnections": {}
 }
+
+
+

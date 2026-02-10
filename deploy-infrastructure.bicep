@@ -21,6 +21,13 @@ var reportStorageAccountName = 'rptcb${uniqueSuffix}'
 var errorWorkspaceName = 'law-chargeback-${uniqueSuffix}'
 var dceEndpointName = 'dce-chargeback-${uniqueSuffix}'
 var dcrName = 'dcr-chargeback-${uniqueSuffix}'
+var userManagedIdentityName = 'id-chargeback-${uniqueSuffix}'
+
+// User Assigned Managed Identity
+resource userManagedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: userManagedIdentityName
+  location: location
+}
 
 // App Service Plan for Logic App
 resource appServicePlan 'Microsoft.Web/serverfarms@2022-09-01' = {
@@ -84,13 +91,16 @@ resource reportContainer 'Microsoft.Storage/storageAccounts/blobServices/contain
   }
 }
 
-// Logic App with system-assigned managed identity
+// Logic App with user-assigned managed identity
 resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
   name: logicAppName
   location: location
   kind: 'functionapp,workflowapp'
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userManagedIdentity.id}': {}
+    }
   }
   properties: {
     serverFarmId: appServicePlan.id
@@ -148,6 +158,18 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
         {
           name: 'REPORT_STORAGE_ACCOUNT_NAME'
           value: reportStorage.name
+        }
+        {
+          name: 'USER_MANAGED_IDENTITY_NAME'
+          value: userManagedIdentity.name
+        }
+        {
+          name: 'USER_MANAGED_IDENTITY_CLIENT_ID'
+          value: userManagedIdentity.properties.clientId
+        }
+        {
+          name: 'LOG_ANALYTICS_WORKSPACE_ID'
+          value: sourceWorkspaceRbac.outputs.workspaceCustomerId
         }
       ]
       netFrameworkVersion: 'v6.0'
@@ -246,33 +268,33 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
 
 // RBAC: Storage Blob Data Contributor on report storage for Logic App
 resource storageBlobRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(reportStorage.id, logicApp.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  name: guid(reportStorage.id, userManagedIdentity.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
   scope: reportStorage
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
-    principalId: logicApp.identity.principalId
+    principalId: userManagedIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
 // RBAC: Monitoring Metrics Publisher on DCR for Logic App
 resource dcrRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(dcr.id, logicApp.id, '3913510d-42f4-4e42-8a64-420c390055eb')
+  name: guid(dcr.id, userManagedIdentity.id, '3913510d-42f4-4e42-8a64-420c390055eb')
   scope: dcr
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
-    principalId: logicApp.identity.principalId
+    principalId: userManagedIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
 
 // RBAC: Monitoring Metrics Publisher on DCE for Logic App
 resource dceRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(dce.id, logicApp.id, '3913510d-42f4-4e42-8a64-420c390055eb')
+  name: guid(dce.id, userManagedIdentity.id, '3913510d-42f4-4e42-8a64-420c390055eb')
   scope: dce
   properties: {
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '3913510d-42f4-4e42-8a64-420c390055eb')
-    principalId: logicApp.identity.principalId
+    principalId: userManagedIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
 }
@@ -283,12 +305,15 @@ module sourceWorkspaceRbac 'modules/logAnalyticsRbac.bicep' = {
   scope: resourceGroup(sourceWorkspaceResourceGroup)
   params: {
     workspaceName: sourceLogAnalyticsWorkspace
-    principalId: logicApp.identity.principalId
+    principalId: userManagedIdentity.properties.principalId
   }
 }
 
 // Outputs
-output logicAppIdentity string = logicApp.identity.principalId
+output userManagedIdentityId string = userManagedIdentity.id
+output userManagedIdentityName string = userManagedIdentity.name
+output userManagedIdentityClientId string = userManagedIdentity.properties.clientId
+output userManagedIdentityPrincipalId string = userManagedIdentity.properties.principalId
 output logicAppName string = logicApp.name
 output logicAppStorageAccountName string = logicAppStorage.name
 output reportStorageAccountName string = reportStorage.name
@@ -298,3 +323,4 @@ output errorWorkspaceName string = errorWorkspace.name
 output errorWorkspaceId string = errorWorkspace.properties.customerId
 output sourceWorkspaceName string = sourceLogAnalyticsWorkspace
 output sourceWorkspaceResourceGroup string = sourceWorkspaceResourceGroup
+output sourceWorkspaceId string = sourceWorkspaceRbac.outputs.workspaceCustomerId

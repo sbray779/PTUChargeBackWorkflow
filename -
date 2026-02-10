@@ -1,0 +1,2 @@
+ProductId,ModelName,PromptTokens,CompletionTokens,TotalTokens,Calls,FirstSeen,LastSeen,Regions,CallerIpAddresses,Caches,BackendIds
+oai-retail-assistant,gpt-4o-mini-2024-07-18,55,100,155,1,2026-02-06T16:33:36.9049648Z,2026-02-06T16:33:36.9049648Z,"[""East US 2""]","[""20.236.11.102""]","[""none""]","[""openai-backend-0""]"

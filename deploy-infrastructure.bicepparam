@@ -1,6 +1,6 @@
 using './deploy-infrastructure.bicep'
 
-param resourceGroupName = '<YOUR_RESOURCE_GROUP_NAME>'
-param location = '<YOUR_AZURE_REGION>'
-param sourceLogAnalyticsWorkspace = '<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>'
-param sourceWorkspaceResourceGroup = '<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>'
+param resourceGroupName = '<your-resource-group-name>'
+param location = '<your-azure-region>'
+param sourceLogAnalyticsWorkspace = '<your-log-analytics-workspace-name>'
+param sourceWorkspaceResourceGroup = '<your-source-workspace-resource-group>'
