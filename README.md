@@ -2,34 +2,42 @@
 
 This repository contains an automated deployment solution for an Azure Logic App (Standard) that generates daily chargeback reports from API Management LLM usage logs.
 
-It is assumed that there is an existing APIM instance being used as an AI Gateway and that LLM logging has been enabled on desired APIs which are sending prompt/response logs to an existing
-log analytics workspace.  This solution is designed to do the following:
+It is assumed that there is an existing APIM instance being used as an AI Gateway and that LLM logging has been enabled on desired APIs which are sending prompt/response logs to an existing Log Analytics workspace. This solution is designed to do the following:
 
-1) Query the target log analytics workspace, summarize token utilization by product/subscritpin
-2) Summarize the data into CSV format
-3) Send the data to blob storage for later retrieval
+1. Query the target Log Analytics workspace and summarize token utilization by product/subscription
+2. Summarize the data into CSV format
+3. Send the data to blob storage for later retrieval
 
-By default, the workflow is triggered daily.
+By default, the workflow is triggered every 24 hours.
 
 ## Overview
 
 The solution uses **Bicep templates** and **PowerShell** to deploy a complete infrastructure including:
-- **Logic App (Standard)** - Workflow engine with user-assigned managed identity
-- **User-Assigned Managed Identity** - Centrally managed identity for all authentication
-- **API Connections** - Azure Monitor Logs and Azure Blob Storage (V2) with managed identity authentication
-- **Storage Accounts** - Separate accounts for Logic App internal storage and report output
-- **Log Analytics Workspace** - Error logging and monitoring
-- **Data Collection Rule/Endpoint** - Custom log ingestion for workflow errors
-- **RBAC Assignments** - All necessary permissions configured automatically
+- **Logic App (Standard)** — Workflow engine with user-assigned managed identity
+- **User-Assigned Managed Identity** — Centrally managed identity for all authentication
+- **API Connections** — Azure Monitor Logs and Azure Blob Storage (V2) with managed identity authentication
+- **Storage Accounts** — Separate accounts for Logic App internal storage and report output
+- **Log Analytics Workspace** — Error logging and monitoring
+- **Data Collection Rule/Endpoint** — Custom log ingestion for workflow errors
+- **RBAC Assignments** — All necessary permissions configured automatically
 
-## Workflow Features
+## Workflow Overview
 
-The deployed workflow:
-1. **Queries Log Analytics** daily for LLM token usage from ApiManagementGatewayLogs and ApiManagementGatewayLlmLog
-2. **Aggregates data** by ProductId and ModelName with token counts, call counts, and metadata (regions, IPs, caches, backends)
-3. **Generates CSV report** and uploads to blob storage container
-4. **Error Handling** - Logs query failures and blob write failures to custom Log Analytics table via Data Collection Rules
-5. **User-Assigned Managed Identity** - All authentication uses a centrally managed user-assigned identity (no keys/secrets)
+The `CreateChargeBackReport` workflow uses an **asynchronous query pattern** against the Log Analytics REST API to avoid HTTP timeouts on long-running queries:
+
+1. **Submit_Async_Query** — Sends the KQL query to the Log Analytics REST API with `Prefer: wait=0` header, which returns immediately with either a `200` (results ready) or `202` (query accepted, poll for results)
+2. **Check_If_Query_Completed_Synchronously** — Branches based on the HTTP status code:
+   - **200 path**: Results returned inline → `Set_Sync_Results`
+   - **202 path**: Captures the `Location` header → waits 10 seconds → enters polling loop
+3. **Poll_For_Query_Results** — An Until loop that polls the Location URL every 15 seconds (up to 60 iterations / 30 minutes) via `Check_Query_Status` until the query completes with HTTP 200
+4. **Merge_Query_Results** — Selects the final result body from whichever path was taken
+5. **Transform_Query_Results_To_Rows** — Converts the columnar Log Analytics response (`tables[0].rows`) into named objects using positional array indexes matching the KQL `project` clause
+6. **Create_CSV_table** — Converts the row objects to CSV format
+7. **Create_blob_(V2)** — Uploads the CSV to blob storage at `reportoutput/dailyChargeBackReport.csv`
+
+**Error Handlers** (run on failure/timeout of upstream actions):
+- **Handle_Query_Failure** — Logs query errors to a custom Log Analytics table via Data Collection Rules
+- **Handle_Blob_Write_Failure** — Logs blob write errors to the same custom table
 
 ## Prerequisites
 
@@ -40,27 +48,29 @@ The deployed workflow:
 - **Contributor access** to the target Azure subscription
 - An **existing Log Analytics workspace** containing `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables
 
-## Deployment
+## Deployment (Full — New Infrastructure)
+
+This deploys everything from scratch: infrastructure, API connections, RBAC, and the workflow.
 
 ### Step 1: Configure Parameters
 
-Edit the `deploy-infrastructure.bicepparam` file and replace the placeholder values with your environment-specific settings:
+Edit `deploy-infrastructure.bicepparam` and replace the placeholder values:
 
 ```bicep
 using './deploy-infrastructure.bicep'
 
-param resourceGroupName = '<YOUR_RESOURCE_GROUP_NAME>'
-param location = '<YOUR_AZURE_REGION>'
-param sourceLogAnalyticsWorkspace = '<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>'
-param sourceWorkspaceResourceGroup = '<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>'
+param resourceGroupName = '<your-resource-group-name>'
+param location = '<your-azure-region>'
+param sourceLogAnalyticsWorkspace = '<your-log-analytics-workspace-name>'
+param sourceWorkspaceResourceGroup = '<your-source-workspace-resource-group>'
 ```
 
-| Placeholder | Description | Example |
-|-------------|-------------|---------|
-| `<YOUR_RESOURCE_GROUP_NAME>` | Target resource group where the Logic App and supporting resources will be deployed | `rg-chargeback-prod` |
-| `<YOUR_AZURE_REGION>` | Azure region for deployment | `eastus2`, `westus2`, `centralus` |
-| `<YOUR_LOG_ANALYTICS_WORKSPACE_NAME>` | Name of the existing Log Analytics workspace containing `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables from your APIM AI Gateway | `MyLLMLogsWorkspace` |
-| `<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>` | Resource group containing the source Log Analytics workspace | `MyLLMLogsResourceGroup` |
+| Parameter | Description | Example |
+|-----------|-------------|---------|
+| `resourceGroupName` | Target resource group for all deployed resources | `rg-chargeback-prod` |
+| `location` | Azure region for deployment | `eastus2`, `westus2`, `centralus` |
+| `sourceLogAnalyticsWorkspace` | Name of the existing Log Analytics workspace containing APIM LLM logs | `MyLLMLogsWorkspace` |
+| `sourceWorkspaceResourceGroup` | Resource group containing the source Log Analytics workspace | `MyLLMLogsResourceGroup` |
 
 ### Step 2: Run Deployment Script
 
@@ -68,40 +78,114 @@ param sourceWorkspaceResourceGroup = '<YOUR_LOG_ANALYTICS_RESOURCE_GROUP>'
 .\Deploy-ChargeBackLogicApp-v2.ps1
 ```
 
-The script will automatically:
-1. Create or verify the resource group
-2. Deploy infrastructure using Bicep
-3. Create API connections with access policies
-4. Retrieve connection runtime URLs
-5. Assign all required RBAC roles
-6. Update workflow with deployment-specific values
-7. Deploy workflow to Logic App
-8. Restart Logic App to apply permissions
+The script executes 8 steps automatically:
 
-### Parameters (in bicepparam file)
+| Step | Action |
+|------|--------|
+| 1 | Create or verify resource group |
+| 2 | Deploy infrastructure via Bicep (Logic App, storage, identity, DCR/DCE, RBAC) |
+| 3 | Create API connections (Azure Monitor Logs + Azure Blob) with managed identity access policies |
+| 4 | Retrieve connection runtime URLs |
+| 5 | Assign RBAC roles (Website Contributor, Log Analytics Reader, Reader on source workspace) |
+| 6 | Substitute `{{placeholders}}` in `workflow.json` and `connections.json` with deployment values |
+| 7 | Deploy workflow to Logic App via `func azure functionapp publish` |
+| 8 | Restart Logic App to apply permissions |
 
-| Parameter | Required | Description | Example |
-|-----------|----------|-------------|---------|
-| `resourceGroupName` | Yes | Name of the resource group for deployment | `rg-chargeback-prod` |
-| `location` | Yes | Azure region for deployment | `eastus2` |
-| `sourceLogAnalyticsWorkspace` | Yes | Name of workspace containing LLM logs | `MyLLMLogsWorkspace` |
-| `sourceWorkspaceResourceGroup` | Yes | Resource group of source workspace | `MyLLMLogsWorkspace-RG` |
+### Step 3: Verify
+
+1. Navigate to the Logic App in the Azure Portal → Workflows → `CreateChargeBackReport`
+2. Verify workflow health shows **Healthy**
+3. Click **Run Trigger** to test, or trigger via CLI:
+   ```powershell
+   # Check workflow health
+   az rest --method GET `
+     --uri "https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{logicAppName}/hostruntime/runtime/webhooks/workflow/api/management/workflows?api-version=2024-04-01"
+
+   # Trigger a manual run
+   az rest --method POST `
+     --uri "https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{logicAppName}/hostruntime/runtime/webhooks/workflow/api/management/workflows/CreateChargeBackReport/triggers/Recurrence/run?api-version=2024-04-01"
+   ```
+4. Check run history for success/failure
+5. Verify the CSV appears in storage: `rptcb{suffix}/reportoutput/dailyChargeBackReport.csv`
+
+## Deployment (Workflow Only — Existing Logic App)
+
+If you already have a Logic App deployed and only need to update the workflow (e.g., after modifying the KQL query or workflow logic), follow these steps.
+
+### Prerequisites
+
+- The target Logic App must already exist and have:
+  - A user-assigned managed identity configured
+  - The `LOG_ANALYTICS_WORKSPACE_ID` app setting populated
+  - API connections (`azuremonitorlogs`, `azureblob`) already created
+
+### Step 1: Update Placeholders
+
+The `workflow.json` and `connections.json` files contain `{{placeholder}}` tokens that must be replaced with your deployment values before publishing:
+
+| Placeholder | Description | Where to find the value |
+|-------------|-------------|------------------------|
+| `{{USER_MANAGED_IDENTITY_ID}}` | Full resource ID of the user-assigned managed identity | `az identity show --name <name> --resource-group <rg> --query id -o tsv` |
+| `{{DCE_ENDPOINT}}` | Data Collection Endpoint ingestion URL | `az monitor data-collection endpoint show --name <name> --resource-group <rg> --query logsIngestion.endpoint -o tsv` |
+| `{{DCR_IMMUTABLE_ID}}` | Data Collection Rule immutable ID | `az monitor data-collection rule show --name <name> --resource-group <rg> --query immutableId -o tsv` |
+| `{{AZURE_MONITOR_LOGS_RUNTIME_URL}}` | Azure Monitor Logs API connection runtime URL | Azure Portal → API Connections → azuremonitorlogs → Properties |
+| `{{AZURE_BLOB_RUNTIME_URL}}` | Azure Blob API connection runtime URL | Azure Portal → API Connections → azureblob → Properties |
+
+Replace placeholders using PowerShell:
+
+```powershell
+# Set your values
+$identityId = "<your-managed-identity-resource-id>"
+$dceEndpoint = "<your-dce-endpoint-url>"
+$dcrImmutableId = "<your-dcr-immutable-id>"
+$monitorLogsUrl = "<your-azuremonitorlogs-runtime-url>"
+$blobUrl = "<your-azureblob-runtime-url>"
+
+# Replace in workflow.json
+$wf = Get-Content .\CreateChargeBackReport\workflow.json -Raw
+$wf = $wf -replace '\{\{USER_MANAGED_IDENTITY_ID\}\}', $identityId `
+          -replace '\{\{DCE_ENDPOINT\}\}', $dceEndpoint `
+          -replace '\{\{DCR_IMMUTABLE_ID\}\}', $dcrImmutableId
+$wf | Set-Content .\CreateChargeBackReport\workflow.json -Encoding UTF8
+
+# Replace in connections.json
+$conn = Get-Content .\connections.json -Raw
+$conn = $conn -replace '\{\{USER_MANAGED_IDENTITY_ID\}\}', $identityId `
+              -replace '\{\{AZURE_MONITOR_LOGS_RUNTIME_URL\}\}', $monitorLogsUrl `
+              -replace '\{\{AZURE_BLOB_RUNTIME_URL\}\}', $blobUrl
+$conn | Set-Content .\connections.json -Encoding UTF8
+```
+
+### Step 2: Publish the Workflow
+
+```powershell
+func azure functionapp publish <your-logic-app-name>
+```
+
+### Step 3: Restart the Logic App
+
+```powershell
+az logicapp restart --name <your-logic-app-name> --resource-group <your-resource-group>
+```
+
+> **Important:** If you encounter stale workflow definitions after publishing (e.g., the portal still shows old action definitions), you may need to stop the Logic App, delete the backing storage account's content share, and redeploy the full infrastructure. Logic App Standard caches workflow definitions in the Azure Files share, and file-level deployments may not always clear the cache.
 
 ## What Gets Deployed
 
 ### Infrastructure Resources (via Bicep)
 
-1. **App Service Plan** - `asp-chargeback-{uniqueSuffix}` (WS1 SKU for Logic Apps)
-2. **User-Assigned Managed Identity** - `id-chargeback-{uniqueSuffix}` for centralized authentication
-3. **Logic App** - `logic-chargeback-{uniqueSuffix}` configured with user-assigned managed identity
-4. **Logic App Storage Account** - `lacb{uniqueSuffix}` with key-based auth (required for Logic App runtime)
-5. **File Share** - Created in Logic App storage for internal operations
-6. **Report Storage Account** - `rptcb{uniqueSuffix}` with managed identity only (no keys)
-7. **Blob Container** - `reportoutput` in report storage for CSV files
-8. **Log Analytics Workspace** - `law-chargeback-{uniqueSuffix}` for error logging
-9. **Custom Log Table** - `WorkflowFailures_CL` with schema for error tracking
-10. **Data Collection Endpoint** - `dce-chargeback-{uniqueSuffix}` for log ingestion
-11. **Data Collection Rule** - `dcr-chargeback-{uniqueSuffix}` routes errors to custom table
+| Resource | Name Pattern | Purpose |
+|----------|-------------|---------|
+| App Service Plan | `asp-chargeback-{suffix}` | WS1 SKU for Logic Apps Standard |
+| User-Assigned Managed Identity | `id-chargeback-{suffix}` | Centralized authentication for all services |
+| Logic App | `logic-chargeback-{suffix}` | Workflow engine |
+| Logic App Storage | `lacb{suffix}` | Internal runtime storage (key-based auth required) |
+| Report Storage | `rptcb{suffix}` | CSV report output (managed identity only, no keys) |
+| Blob Container | `reportoutput` | Container for daily CSV reports |
+| Log Analytics Workspace | `law-chargeback-{suffix}` | Error logging |
+| Custom Table | `WorkflowFailures_CL` | Schema for workflow error records |
+| Data Collection Endpoint | `dce-chargeback-{suffix}` | Log ingestion endpoint |
+| Data Collection Rule | `dcr-chargeback-{suffix}` | Routes errors to custom table |
 
 ### API Connections (via PowerShell)
 
@@ -111,92 +195,85 @@ The script will automatically:
 
 ### RBAC Role Assignments
 
-All RBAC roles are assigned to the **user-assigned managed identity** (`id-chargeback-{uniqueSuffix}`):
+All RBAC roles are assigned to the **user-assigned managed identity** (`id-chargeback-{suffix}`):
 
 | Role | Scope | Purpose | Assigned By |
 |------|-------|---------|-------------|
 | Storage Blob Data Contributor | Report storage account | Write CSV reports | Bicep |
 | Monitoring Metrics Publisher | Data Collection Rule | Ingest error logs | Bicep |
 | Monitoring Metrics Publisher | Data Collection Endpoint | Send logs to DCE | Bicep |
-| Log Analytics Reader | Source workspace | Query LLM logs | Bicep |
-| Website Contributor | Logic App resource | Dynamic schema retrieval | PowerShell |
+| Log Analytics Reader | Source workspace | Query LLM logs | Bicep + PowerShell |
 | Reader | Source workspace | Read workspace metadata | PowerShell |
+| Website Contributor | Logic App resource | Dynamic schema retrieval | PowerShell |
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Resource Group: rg-chargeback-prod                              │
+│ Resource Group                                                  │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────────────┐                                          │
 │  │  User-Assigned   │◀─── Used by Logic App & API Connections  │
 │  │ Managed Identity │                                          │
-│  │  (id-chargeback) │                                          │
 │  └────────┬─────────┘                                          │
 │           │                                                     │
 │           ▼                                                     │
-│  ┌──────────────────┐         ┌──────────────────┐            │
-│  │   Logic App      │────────▶│  API Connection  │            │
-│  │   (Standard)     │         │  azuremonitorlogs│            │
-│  └────────┬─────────┘         └────────┬─────────┘            │
+│  ┌──────────────────────────────────────────────┐              │
+│  │ Logic App (Standard)                         │              │
+│  │                                              │              │
+│  │  ┌─ CreateChargeBackReport ───────────────┐  │              │
+│  │  │ Recurrence Trigger (every 24h)         │  │              │
+│  │  │        │                               │  │              │
+│  │  │        ▼                               │  │              │
+│  │  │ Submit_Async_Query (HTTP POST)         │  │              │
+│  │  │ Prefer: wait=0                        │  │              │
+│  │  │        │                               │  │              │
+│  │  │    ┌───┴───┐                           │  │              │
+│  │  │  200?    202?                          │  │              │
+│  │  │    │       │                           │  │              │
+│  │  │  Sync   Poll_For_Query_Results         │  │              │
+│  │  │  Path   (Until loop, 15s intervals)    │  │              │
+│  │  │    │       │                           │  │              │
+│  │  │    └───┬───┘                           │  │              │
+│  │  │        ▼                               │  │              │
+│  │  │ Merge_Query_Results                    │  │              │
+│  │  │        ▼                               │  │              │
+│  │  │ Transform_Query_Results_To_Rows        │  │              │
+│  │  │ (Select: @item()[0]..@item()[11])      │  │              │
+│  │  │        ▼                               │  │              │
+│  │  │ Create_CSV_table → Create_blob_(V2)    │  │              │
+│  │  └────────────────────────────────────────┘  │              │
+│  └──────────────────────────────────────────────┘              │
 │           │                            │                       │
-│           │                            ▼                       │
-│           │                   ┌─────────────────────┐         │
-│           │                   │ Source Log Analytics│         │
-│           │                   │   (External RG)     │         │
-│           │                   └─────────────────────┘         │
-│           │                                                    │
-│           │         ┌──────────────────┐                      │
-│           │────────▶│  API Connection  │                      │
-│           │         │    azureblob     │                      │
-│           │         └────────┬─────────┘                      │
-│           │                  │                                │
-│           ▼                  ▼                                │
-│  ┌──────────────────┐  ┌──────────────────┐                 │
-│  │ Storage (lacb*)  │  │ Storage (rptcb*) │                 │
-│  │ Internal/Runtime │  │ CSV Reports Only │                 │
-│  │ (Key Auth)       │  │ (Managed ID Only)│                 │
-│  └──────────────────┘  └──────────────────┘                 │
+│           ▼                            ▼                       │
+│  ┌──────────────────┐  ┌──────────────────┐                   │
+│  │ Storage (lacb*)  │  │ Storage (rptcb*) │                   │
+│  │ Internal/Runtime │  │ reportoutput/    │                   │
+│  │ (Key Auth)       │  │ dailyChargeback  │                   │
+│  └──────────────────┘  │ Report.csv       │                   │
+│                        │ (Managed ID Only)│                   │
+│                        └──────────────────┘                   │
 │                                                                │
-│  ┌──────────────────┐         ┌──────────────────┐           │
-│  │   DCE/DCR        │────────▶│  Error Workspace │           │
-│  │   Error Logging  │         │  (Custom Table)  │           │
-│  └──────────────────┘         └──────────────────┘           │
-│                                                                │
+│  ┌──────────────────┐  ┌──────────────────┐                   │
+│  │ DCE/DCR          │─▶│ Error Workspace  │                   │
+│  │ Error Logging    │  │ WorkflowFailures │                   │
+│  └──────────────────┘  │ _CL              │                   │
+│                        └──────────────────┘                   │
 └─────────────────────────────────────────────────────────────────┘
+            │
+            ▼
+┌──────────────────────────────┐
+│ Source Log Analytics         │
+│ (External Resource Group)    │
+│ ApiManagementGatewayLogs     │
+│ ApiManagementGatewayLlmLog   │
+└──────────────────────────────┘
 ```
 
-## Workflow Details
+## KQL Query
 
-### Trigger
-- **Type**: Recurrence
-- **Schedule**: Every 24 hours
-- **Timezone**: Central Standard Time
-
-### Actions
-
-1. **Run_query_and_list_results**
-   - Queries ApiManagementGatewayLogs for last 24 hours
-   - Joins with ApiManagementGatewayLlmLog for token metrics
-   - Aggregates by ProductId and ModelName
-
-2. **Create_CSV_table**
-   - Converts query results to CSV format
-
-3. **Create_blob_(V2)**
-   - Uploads CSV to `reportoutput/dailyChargeBackReport.csv`
-   - Overwrites existing report
-
-4. **Handle_Query_Failure** (error handler)
-   - Triggers on query timeout/failure
-   - Logs error details to WorkflowFailures_CL table via DCR
-
-5. **Handle_Blob_Write_Failure** (error handler)
-   - Triggers on blob write timeout/failure
-   - Logs error details to WorkflowFailures_CL table via DCR
-
-### KQL Query
+The workflow executes this query against the source Log Analytics workspace:
 
 ```kql
 ApiManagementGatewayLogs 
@@ -219,31 +296,32 @@ ApiManagementGatewayLogs
 | order by TotalTokens desc
 ```
 
+The `Transform_Query_Results_To_Rows` action maps the columnar result to named fields using positional indexes that match the `project` clause order:
+
+| Index | Column |
+|-------|--------|
+| 0 | ProductId |
+| 1 | ModelName |
+| 2 | PromptTokens |
+| 3 | CompletionTokens |
+| 4 | TotalTokens |
+| 5 | Calls |
+| 6 | FirstSeen |
+| 7 | LastSeen |
+| 8 | Regions |
+| 9 | CallerIpAddresses |
+| 10 | Caches |
+| 11 | BackendIds |
+
+> **Important:** If you modify the `project` clause in the KQL query, you must also update the positional indexes in `Transform_Query_Results_To_Rows` in `workflow.json` to match.
+
 ## Post-Deployment
-
-### Verify Deployment
-
-1. **Check Logic App**
-   ```powershell
-   az logicapp show --name logic-chargeback-{uniqueSuffix} --resource-group rg-chargeback-prod
-   ```
-
-2. **View Workflow in Portal**
-   - Navigate to Logic App → Workflows → CreateChargeBackReport
-   - Verify connections show as "Connected" with managed identity
-
-3. **Test Workflow**
-   - In portal, click "Run Trigger" to manually test
-   - Check run history for success/failure
-   - Verify CSV appears in storage: `rptcb{suffix}/reportoutput/dailyChargeBackReport.csv`
 
 ### Monitor
 
 - **Report Output**: Check blob storage container `reportoutput` for `dailyChargeBackReport.csv`
-- **Error Logs**: Query `WorkflowFailures_CL` table in error workspace
-- **Workflow Runs**: View run history in Logic App portal
-
-### Query Errors
+- **Workflow Runs**: View run history in Logic App portal → Workflows → CreateChargeBackReport
+- **Error Logs**: Query `WorkflowFailures_CL` table in error workspace:
 
 ```kql
 WorkflowFailures_CL
@@ -257,50 +335,50 @@ WorkflowFailures_CL
 ### Connection Errors
 
 If connections show as "Invalid" or "Forbidden":
-1. Verify Logic App has user-assigned managed identity configured in Azure Portal
-2. Check that the user-assigned managed identity resource exists: `id-chargeback-{uniqueSuffix}`
-3. Verify RBAC role assignments are properly configured on the managed identity
-4. Wait 30-60 seconds for permissions to propagate
-5. Restart the Logic App to refresh identity token:
+1. Verify the user-assigned managed identity resource exists: `id-chargeback-{suffix}`
+2. Check that the Logic App has the identity configured in its Identity settings
+3. Verify RBAC role assignments on the managed identity
+4. Wait 30–60 seconds for permissions to propagate
+5. Restart the Logic App:
    ```powershell
-   az logicapp restart --name logic-chargeback-{uniqueSuffix} --resource-group rg-chargeback-prod
+   az logicapp restart --name <logic-app-name> --resource-group <rg>
    ```
 
 ### Query Failures (InsufficientAccessError)
 
-- Verify source workspace name and resource group are correct in parameters file
-- Check Logic App has **both** Log Analytics Reader and Reader roles on source workspace
-- Ensure `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables exist
-- Wait 30-60 seconds after RBAC assignment, then restart Logic App
+- Verify the source workspace name and resource group are correct in `deploy-infrastructure.bicepparam`
+- Confirm the managed identity has both **Log Analytics Reader** and **Reader** roles on the source workspace
+- Ensure `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables exist in the workspace
+- Restart the Logic App after RBAC changes
 
 ### Blob Write Failures
 
-- Verify report storage account has `allowSharedKeyAccess: false` (managed identity only)
-- Check Storage Blob Data Contributor role assignment via Bicep deployment
-- Ensure `reportoutput` container exists
-- Verify container has no public access configured
+- Verify the report storage account has `allowSharedKeyAccess: false` (managed identity only)
+- Check **Storage Blob Data Contributor** role assignment on the report storage account
+- Ensure the `reportoutput` container exists
 
-### Dynamic Schema Errors
+### Stale Workflow Definitions After Deploy
 
-If you see "Failed to retrieve dynamic outputs":
-- Verify Website Contributor role is assigned to Logic App on itself
-- Restart Logic App after RBAC changes
-- Wait for permissions to propagate (up to 5 minutes)
+If the portal shows old action definitions after publishing:
+1. **Stop** the Logic App
+2. **Delete** the Logic App's backing storage account (`lacb{suffix}`)
+3. **Delete** the Logic App itself
+4. Re-run the full deployment script (`Deploy-ChargeBackLogicApp-v2.ps1`)
 
-### Error Handling Not Working
+This happens because Logic App Standard stores workflow definitions in an Azure Files share, and file-level deployments may not always clear the cache.
 
-- Verify DCR and DCE exist and are properly configured
-- Check Monitoring Metrics Publisher roles on both DCR and DCE (assigned via Bicep)
-- Restart Logic App to refresh permissions
-- Verify DCE public network access is enabled
+### Service Unavailable in Portal
+
+If the portal shows "Service Unavailable" but the workflow runs successfully via CLI:
+- This is typically a transient portal issue after a fresh deployment
+- Trigger the workflow via CLI to verify it works
+- The portal usually recovers after a few minutes
 
 ## Customization
 
 ### Modify Query
 
-Edit the `body` field in `Run_query_and_list_results` action in [CreateChargeBackReport/workflow.json](CreateChargeBackReport/workflow.json):
-- Keep the query as a single-line string
-- Test query in Log Analytics first before deploying
+Edit the `query` field in the `Submit_Async_Query` action in [CreateChargeBackReport/workflow.json](CreateChargeBackReport/workflow.json). If you change the `project` columns, you must also update the positional indexes in `Transform_Query_Results_To_Rows` to match (see column index table above).
 
 ### Change Schedule
 
@@ -327,31 +405,37 @@ Edit `Create_blob_(V2)` action `queries`:
 ## Files
 
 ```
-LogicApp/
-├── Deploy-ChargeBackLogicApp.ps1          # Main deployment script
-├── README.md                               # This file
-└── TokenUsage/
-    └── TokenUtilization/
-        ├── host.json                       # Logic App host configuration
-        ├── local.settings.json             # Local development settings
-        ├── connections.json                # Template for API connections (ignored in deployment)
-        └── CreateChargeBackReport/
-            └── workflow.json               # Workflow definition
+PTUChargeBackWorkflow/
+├── Deploy-ChargeBackLogicApp-v2.ps1       # Full deployment script (8 steps)
+├── deploy-infrastructure.bicep            # Bicep template for all infrastructure
+├── deploy-infrastructure.bicepparam       # Deployment parameters (edit before deploying)
+├── modules/
+│   └── logAnalyticsRbac.bicep             # Cross-resource-group RBAC module
+├── connections.json                       # API connection definitions ({{placeholders}})
+├── host.json                              # Logic App host configuration
+├── local.settings.json                    # Local development settings
+├── parameters.json                        # ARM parameters (legacy)
+├── CreateChargeBackReport/
+│   └── workflow.json                      # Workflow definition ({{placeholders}})
+├── workflow-designtime/
+│   ├── host.json                          # Design-time host config
+│   └── local.settings.json               # Design-time local settings
+└── README.md                              # This file
 ```
 
 ## Important Notes
 
-1. **User-Assigned Managed Identity**: The solution uses a user-assigned managed identity (`id-chargeback-{uniqueSuffix}`) instead of system-assigned. This provides better lifecycle management and allows the identity to persist independently of the Logic App.
+1. **Placeholder Tokens**: The `workflow.json` and `connections.json` files contain `{{placeholder}}` tokens (e.g., `{{USER_MANAGED_IDENTITY_ID}}`) that are replaced at deployment time by Step 6 of the deployment script. Do not commit files with hardcoded deployment values.
 
-2. **connections.json Updates**: The `connections.json` file is updated during deployment with the actual user-managed identity resource ID and connection runtime URLs.
+2. **User-Assigned Managed Identity**: The solution uses a user-assigned managed identity (`id-chargeback-{suffix}`) instead of system-assigned. This provides better lifecycle management and allows the identity to persist independently of the Logic App.
 
-3. **Identity Token Refresh**: After deployment, the Logic App is restarted automatically to refresh the managed identity token and pick up new RBAC assignments.
+3. **Async Query Pattern**: The workflow uses the Log Analytics REST API with `Prefer: wait=0` rather than the managed API connector, enabling asynchronous query execution to avoid HTTP timeouts on large datasets.
 
-4. **Resource Naming**: Resource names include random suffixes to ensure uniqueness across Azure.
+4. **Positional Column Mapping**: `Transform_Query_Results_To_Rows` uses `@item()[N]` positional indexes rather than column-name lookups, because Logic App Standard expression language does not support `where()`/`first()`/`indexOf()` functions on arrays.
 
-5. **Connection Names**: API connections are named `azuremonitorlogs` and `azureblob` (without suffixes) to match workflow references.
+5. **Storage Cache**: Logic App Standard stores workflow definitions in an Azure Files share. When redeploying, if old definitions persist, delete both the Logic App and its backing storage account before redeploying.
 
-6. **DCR/DCE URLs**: Error handling URIs are updated automatically during deployment with the newly created DCR/DCE details.
+6. **Resource Naming**: All resource names include a deterministic suffix generated by `uniqueString(resourceGroup().id)` to ensure uniqueness across Azure.
 
 ## License
 

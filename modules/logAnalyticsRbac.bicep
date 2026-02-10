@@ -19,3 +19,6 @@ resource logAnalyticsReaderRole 'Microsoft.Authorization/roleAssignments@2022-04
     principalType: 'ServicePrincipal'
   }
 }
+
+// Output the workspace GUID (customerId) for use as LOG_ANALYTICS_WORKSPACE_ID
+output workspaceCustomerId string = workspace.properties.customerId

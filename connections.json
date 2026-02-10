@@ -9,13 +9,13 @@
       },
       "authentication": {
         "type": "ManagedServiceIdentity",
-        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc"
+        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
       },
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/13e66a34ae174446a3e0a438e41cb2f7",
+      "connectionRuntimeUrl": "{{AZURE_MONITOR_LOGS_RUNTIME_URL}}",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
-          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
+          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
           "audience": "https://management.core.windows.net/",
           "additionalAudiences": [
             "https://api.loganalytics.io"
@@ -32,13 +32,13 @@
       },
       "authentication": {
         "type": "ManagedServiceIdentity",
-        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc"
+        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
       },
-      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/a779dc73781441819a15ba78da114f54",
+      "connectionRuntimeUrl": "{{AZURE_BLOB_RUNTIME_URL}}",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
-          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourcegroups/rg-ptu-chargeback-umIdentity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-d6ykwz2sbdjzc",
+          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
           "audience": "https://storage.azure.com/"
         }
       }
@@ -47,3 +47,6 @@
   "serviceProviderConnections": {},
   "agentConnections": {}
 }
+
+
+

@@ -167,6 +167,10 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'USER_MANAGED_IDENTITY_CLIENT_ID'
           value: userManagedIdentity.properties.clientId
         }
+        {
+          name: 'LOG_ANALYTICS_WORKSPACE_ID'
+          value: sourceWorkspaceRbac.outputs.workspaceCustomerId
+        }
       ]
       netFrameworkVersion: 'v6.0'
       use32BitWorkerProcess: false
@@ -319,3 +323,4 @@ output errorWorkspaceName string = errorWorkspace.name
 output errorWorkspaceId string = errorWorkspace.properties.customerId
 output sourceWorkspaceName string = sourceLogAnalyticsWorkspace
 output sourceWorkspaceResourceGroup string = sourceWorkspaceResourceGroup
+output sourceWorkspaceId string = sourceWorkspaceRbac.outputs.workspaceCustomerId
