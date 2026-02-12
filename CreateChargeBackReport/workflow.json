@@ -1,4 +1,4 @@
-{
+﻿{
   "definition": {
     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
     "contentVersion": "1.0.0.0",
@@ -25,11 +25,11 @@
             "Prefer": "wait=0"
           },
           "body": {
-            "query": "ApiManagementGatewayLogs | where TimeGenerated >= ago(24h) | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc"
+            "query": "let startTime = startofday(now()) - 3h; let endTime = startofday(now()) + 21h; ApiManagementGatewayLogs | where TimeGenerated >= startTime and TimeGenerated < endTime | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc"
           },
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
             "audience": "https://api.loganalytics.io"
           }
         },
@@ -42,7 +42,7 @@
       },
       "Check_If_Query_Completed_Synchronously": {
         "type": "If",
-        "description": "If the API returned 200, the query completed synchronously — skip polling. If 202, we need to poll.",
+        "description": "If the API returned 200, the query completed synchronously â€” skip polling. If 202, we need to poll.",
         "expression": {
           "and": [
             {
@@ -97,7 +97,7 @@
                     "method": "GET",
                     "authentication": {
                       "type": "ManagedServiceIdentity",
-                      "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                      "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
                       "audience": "https://api.loganalytics.io"
                     }
                   },
@@ -223,7 +223,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-ojxkavsiozn4y-y56m.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-070950e93f33496dbdd06580ac38df19/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -243,7 +243,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -261,7 +261,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-ojxkavsiozn4y-y56m.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-070950e93f33496dbdd06580ac38df19/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -281,7 +281,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -298,6 +298,7 @@
   },
   "kind": "stateful"
 }
+
 
 
 
