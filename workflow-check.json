@@ -1,0 +1,22 @@
+{
+  "definition_href": "https://logic-chargeback-tvn4e57jpmg4q.azurewebsites.net/admin/vfs/site/wwwroot/CreateChargeBackReport/workflow.json",
+  "health": {
+    "errorMessage": {
+      "error": {
+        "code": "WorkflowRunActionInputsInvalidProperty",
+        "message": "The inputs of workflow run action 'Merge_Chunk_Rows' of type 'SetVariable' are not valid. Self reference is not supported when updating the value of variable 'AllResults'."
+      }
+    },
+    "state": "Unhealthy"
+  },
+  "href": "https://logic-chargeback-tvn4e57jpmg4q.azurewebsites.net/runtime/webhooks/workflow/api/management/workflows/CreateChargeBackReport",
+  "isDisabled": false,
+  "kind": "Stateful",
+  "name": "CreateChargeBackReport",
+  "triggers": {
+    "Recurrence": {
+      "kind": "",
+      "type": "Recurrence"
+    }
+  }
+}

@@ -1,6 +1,6 @@
 using './deploy-infrastructure.bicep'
 
-param resourceGroupName = '<your-resource-group-name>'
-param location = '<your-azure-region>'
-param sourceLogAnalyticsWorkspace = '<your-log-analytics-workspace-name>'
-param sourceWorkspaceResourceGroup = '<your-source-workspace-resource-group>'
+param resourceGroupName = 'PTUChargeBackChunks'
+param location = 'eastus2'
+param sourceLogAnalyticsWorkspace = 'ChargeBackWorkspace'
+param sourceWorkspaceResourceGroup = 'aihubchargeback'
