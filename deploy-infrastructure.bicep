@@ -171,6 +171,10 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'LOG_ANALYTICS_WORKSPACE_ID'
           value: sourceWorkspaceRbac.outputs.workspaceCustomerId
         }
+        {
+          name: 'REPORT_END_HOUR'
+          value: '21'
+        }
       ]
       netFrameworkVersion: 'v6.0'
       use32BitWorkerProcess: false

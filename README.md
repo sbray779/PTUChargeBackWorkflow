@@ -491,6 +491,30 @@ To use smaller or larger time chunks, edit the `Initialize_Time_Chunks` action. 
 
 Smaller chunks reduce memory usage per query but increase total execution time.
 
+### Configure Report Time Window
+
+By default, the report covers 9pm the previous evening to 9pm the evening before that (24 hours ending at 9pm yesterday). This is controlled by the `REPORT_END_HOUR` app setting.
+
+**Change the report end hour:**
+```powershell
+# Set report to end at midnight (covers midnight-to-midnight)
+az webapp config appsettings set --name logic-chargeback-xxx --resource-group rg-xxx \
+  --settings REPORT_END_HOUR=0
+
+# Set report to end at 5pm (covers 5pm-to-5pm)
+az webapp config appsettings set --name logic-chargeback-xxx --resource-group rg-xxx \
+  --settings REPORT_END_HOUR=17
+```
+
+| REPORT_END_HOUR | Report Window (when run today) |
+|-----------------|-------------------------------|
+| 0 (midnight) | Midnight yesterday to midnight day before |
+| 9 (9am) | 9am yesterday to 9am day before |
+| 17 (5pm) | 5pm yesterday to 5pm day before |
+| 21 (9pm, default) | 9pm yesterday to 9pm day before |
+
+**Note:** The report always covers the 24 hours ending at the specified hour **yesterday**. This ensures complete data even if the workflow runs late.
+
 ### Change Schedule
 
 Edit `Recurrence` trigger:
