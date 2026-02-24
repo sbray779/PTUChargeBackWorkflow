@@ -15,8 +15,11 @@ param sourceWorkspaceResourceGroup string
 // Generate unique suffix for all resource names
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var logicAppName = 'logic-chargeback-${uniqueSuffix}'
+var functionAppName = 'func-chargeback-${uniqueSuffix}'
 var appServicePlanName = 'asp-chargeback-${uniqueSuffix}'
+var functionPlanName = 'asp-func-${uniqueSuffix}'
 var logicAppStorageAccountName = 'lacb${uniqueSuffix}'
+var functionStorageAccountName = 'funcb${uniqueSuffix}'
 var reportStorageAccountName = 'rptcb${uniqueSuffix}'
 var errorWorkspaceName = 'law-chargeback-${uniqueSuffix}'
 var dceEndpointName = 'dce-chargeback-${uniqueSuffix}'
@@ -40,6 +43,71 @@ resource appServicePlan 'Microsoft.Web/serverfarms@2022-09-01' = {
   kind: 'elastic'
   properties: {
     maximumElasticWorkerCount: 20
+  }
+}
+
+// App Service Plan for Function App (Consumption)
+resource functionPlan 'Microsoft.Web/serverfarms@2022-09-01' = {
+  name: functionPlanName
+  location: location
+  sku: {
+    name: 'Y1'
+    tier: 'Dynamic'
+  }
+  kind: 'functionapp'
+  properties: {}
+}
+
+// Storage account for Function App
+resource functionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: functionStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowSharedKeyAccess: true
+    allowBlobPublicAccess: false
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+// Azure Function App for aggregation
+resource functionApp 'Microsoft.Web/sites@2022-09-01' = {
+  name: functionAppName
+  location: location
+  kind: 'functionapp'
+  properties: {
+    serverFarmId: functionPlan.id
+    httpsOnly: true
+    siteConfig: {
+      appSettings: [
+        {
+          name: 'AzureWebJobsStorage'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};AccountKey=${functionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+        {
+          name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${functionStorage.name};AccountKey=${functionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+        {
+          name: 'WEBSITE_CONTENTSHARE'
+          value: toLower(functionAppName)
+        }
+        {
+          name: 'FUNCTIONS_EXTENSION_VERSION'
+          value: '~4'
+        }
+        {
+          name: 'FUNCTIONS_WORKER_RUNTIME'
+          value: 'dotnet-isolated'
+        }
+      ]
+      netFrameworkVersion: 'v8.0'
+      use32BitWorkerProcess: false
+    }
   }
 }
 
@@ -174,6 +242,10 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
         {
           name: 'REPORT_END_HOUR'
           value: '21'
+        }
+        {
+          name: 'AGGREGATE_FUNCTION_URL'
+          value: 'https://${functionAppName}.azurewebsites.net/api/AggregateChunks'
         }
       ]
       netFrameworkVersion: 'v6.0'
@@ -328,3 +400,5 @@ output errorWorkspaceId string = errorWorkspace.properties.customerId
 output sourceWorkspaceName string = sourceLogAnalyticsWorkspace
 output sourceWorkspaceResourceGroup string = sourceWorkspaceResourceGroup
 output sourceWorkspaceId string = sourceWorkspaceRbac.outputs.workspaceCustomerId
+output functionAppName string = functionApp.name
+output aggregateFunctionUrl string = 'https://${functionApp.properties.defaultHostName}/api/AggregateChunks'

@@ -1,0 +1,2 @@
+ProductId,Luma,Workspace,DeploymentName,ModelName,AccountName,SubscriptionId,SkuName,SkuCapacity,BackendId,Endpoint,PromptTokens,CompletionTokens,TotalTokens,Calls,FirstSeen,LastSeen,Regions,CallerIpAddresses
+oai-hr-assistant,,,chat,gpt-4o-mini,openai1-klcxhvw3ilgu2,b5b4a11b-5367-41d2-9ec2-fee75c17c5f9,Standard,20,openai-backend-0,https://openai1-klcxhvw3ilgu2.openai.azure.com/,110,190,300,2,2026-02-23T20:44:17.6630821Z,2026-02-23T20:44:22.7958594Z,East US 2,52.148.140.42; 20.236.11.102

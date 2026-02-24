@@ -1,4 +1,4 @@
-{
+∩╗┐{
   "definition": {
     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
     "contentVersion": "1.0.0.0",
@@ -16,39 +16,111 @@
     "actions": {
       "Initialize_Time_Chunks": {
         "type": "InitializeVariable",
-        "description": "Create 12 x 2-hour time chunks. Each chunk outputs to its own blob.",
+        "description": "Create 12 x 2-hour time chunks to avoid memory limits on large datasets. Each chunk has hoursAgo (start) and hoursUntil (end) relative to now.",
         "inputs": {
           "variables": [
             {
               "name": "TimeChunks",
               "type": "array",
               "value": [
-                { "chunkId": 1, "hoursAgo": 24, "hoursUntil": 22, "blobName": "chargeBack-chunk-01-21h-23h.csv" },
-                { "chunkId": 2, "hoursAgo": 22, "hoursUntil": 20, "blobName": "chargeBack-chunk-02-23h-01h.csv" },
-                { "chunkId": 3, "hoursAgo": 20, "hoursUntil": 18, "blobName": "chargeBack-chunk-03-01h-03h.csv" },
-                { "chunkId": 4, "hoursAgo": 18, "hoursUntil": 16, "blobName": "chargeBack-chunk-04-03h-05h.csv" },
-                { "chunkId": 5, "hoursAgo": 16, "hoursUntil": 14, "blobName": "chargeBack-chunk-05-05h-07h.csv" },
-                { "chunkId": 6, "hoursAgo": 14, "hoursUntil": 12, "blobName": "chargeBack-chunk-06-07h-09h.csv" },
-                { "chunkId": 7, "hoursAgo": 12, "hoursUntil": 10, "blobName": "chargeBack-chunk-07-09h-11h.csv" },
-                { "chunkId": 8, "hoursAgo": 10, "hoursUntil": 8, "blobName": "chargeBack-chunk-08-11h-13h.csv" },
-                { "chunkId": 9, "hoursAgo": 8, "hoursUntil": 6, "blobName": "chargeBack-chunk-09-13h-15h.csv" },
-                { "chunkId": 10, "hoursAgo": 6, "hoursUntil": 4, "blobName": "chargeBack-chunk-10-15h-17h.csv" },
-                { "chunkId": 11, "hoursAgo": 4, "hoursUntil": 2, "blobName": "chargeBack-chunk-11-17h-19h.csv" },
-                { "chunkId": 12, "hoursAgo": 2, "hoursUntil": 0, "blobName": "chargeBack-chunk-12-19h-21h.csv" }
+                { "chunkId": 1, "hoursAgo": 24, "hoursUntil": 22, "label": "21:00-23:00" },
+                { "chunkId": 2, "hoursAgo": 22, "hoursUntil": 20, "label": "23:00-01:00" },
+                { "chunkId": 3, "hoursAgo": 20, "hoursUntil": 18, "label": "01:00-03:00" },
+                { "chunkId": 4, "hoursAgo": 18, "hoursUntil": 16, "label": "03:00-05:00" },
+                { "chunkId": 5, "hoursAgo": 16, "hoursUntil": 14, "label": "05:00-07:00" },
+                { "chunkId": 6, "hoursAgo": 14, "hoursUntil": 12, "label": "07:00-09:00" },
+                { "chunkId": 7, "hoursAgo": 12, "hoursUntil": 10, "label": "09:00-11:00" },
+                { "chunkId": 8, "hoursAgo": 10, "hoursUntil": 8, "label": "11:00-13:00" },
+                { "chunkId": 9, "hoursAgo": 8, "hoursUntil": 6, "label": "13:00-15:00" },
+                { "chunkId": 10, "hoursAgo": 6, "hoursUntil": 4, "label": "15:00-17:00" },
+                { "chunkId": 11, "hoursAgo": 4, "hoursUntil": 2, "label": "17:00-19:00" },
+                { "chunkId": 12, "hoursAgo": 2, "hoursUntil": 0, "label": "19:00-21:00" }
               ]
             }
           ]
         },
         "runAfter": {}
       },
+      "Initialize_All_Results": {
+        "type": "InitializeVariable",
+        "description": "Array to collect all rows from all time chunk queries.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "AllResults",
+              "type": "array",
+              "value": []
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Time_Chunks": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Aggregated_Data": {
+        "type": "InitializeVariable",
+        "description": "Object to store aggregated rows by composite key.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "AggregatedData",
+              "type": "object",
+              "value": {}
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_All_Results": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Seen_Keys": {
+        "type": "InitializeVariable",
+        "description": "Array to track unique composite keys for aggregation.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "SeenKeys",
+              "type": "array",
+              "value": []
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Aggregated_Data": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Final_Results": {
+        "type": "InitializeVariable",
+        "description": "Array to collect final aggregated rows for CSV.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "FinalResults",
+              "type": "array",
+              "value": []
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Seen_Keys": [
+            "Succeeded"
+          ]
+        }
+      },
       "Process_Time_Chunks": {
         "type": "Foreach",
-        "description": "Process each 2-hour chunk: query, transform, create CSV, write blob.",
+        "description": "Iterate through each 4-hour time chunk and execute the query. Runs sequentially to avoid overwhelming Log Analytics.",
         "foreach": "@variables('TimeChunks')",
         "actions": {
           "Submit_Chunk_Query": {
             "type": "Http",
-            "description": "Submit the Log Analytics query for this time chunk.",
+            "description": "Submit the Log Analytics query for this time chunk asynchronously.",
             "inputs": {
               "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('LOG_ANALYTICS_WORKSPACE_ID')}/query",
               "method": "POST",
@@ -114,16 +186,17 @@
                 },
                 "Poll_Chunk_Results": {
                   "type": "Until",
-                  "expression": "@not(equals(outputs('Check_Chunk_Status')['statusCode'], 202))",
+                  "description": "Poll until query completes or timeout.",
+                  "expression": "@equals(outputs('Check_Chunk_Status')['statusCode'], 200)",
                   "limit": {
                     "count": 60,
-                    "timeout": "PT10M"
+                    "timeout": "PT15M"
                   },
                   "actions": {
                     "Check_Chunk_Status": {
                       "type": "Http",
                       "inputs": {
-                        "uri": "@outputs('Get_Poll_Location')",
+                        "uri": "@{outputs('Get_Poll_Location')}",
                         "method": "GET",
                         "authentication": {
                           "type": "ManagedServiceIdentity",
@@ -137,7 +210,7 @@
                       "type": "Wait",
                       "inputs": {
                         "interval": {
-                          "count": 5,
+                          "count": 15,
                           "unit": "Second"
                         }
                       },
@@ -173,7 +246,7 @@
           },
           "Get_Chunk_Results": {
             "type": "Compose",
-            "description": "Get the final query results (from sync or async path).",
+            "description": "Get the final results for this chunk.",
             "inputs": "@if(equals(outputs('Submit_Chunk_Query')['statusCode'], 200), outputs('Set_Chunk_Sync_Results'), outputs('Set_Chunk_Async_Results'))",
             "runAfter": {
               "Check_Chunk_Sync_Or_Async": [
@@ -214,73 +287,22 @@
               ]
             }
           },
-          "Create_Chunk_CSV": {
-            "type": "Table",
-            "description": "Create CSV from this chunk's data.",
+          "Merge_Chunk_Data": {
+            "type": "SetVariable",
+            "description": "Merge this chunk's rows into AllResults using union().",
             "inputs": {
-              "from": "@body('Transform_Chunk_To_Objects')",
-              "format": "CSV"
+              "name": "AllResults",
+              "value": "@union(variables('AllResults'), body('Transform_Chunk_To_Objects'))"
             },
             "runAfter": {
               "Transform_Chunk_To_Objects": [
                 "Succeeded"
               ]
             }
-          },
-          "Delete_Existing_Blob": {
-            "type": "ApiConnection",
-            "description": "Delete existing blob if present (to allow overwrite).",
-            "inputs": {
-              "host": {
-                "connection": {
-                  "referenceName": "azureblob"
-                }
-              },
-              "method": "delete",
-              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files/@{encodeURIComponent(encodeURIComponent(concat('reportoutput/', items('Process_Time_Chunks')['blobName'])))}"
-            },
-            "runAfter": {
-              "Create_Chunk_CSV": [
-                "Succeeded"
-              ]
-            }
-          },
-          "Write_Chunk_Blob": {
-            "type": "ApiConnection",
-            "description": "Write this chunk's CSV to blob storage.",
-            "inputs": {
-              "host": {
-                "connection": {
-                  "referenceName": "azureblob"
-                }
-              },
-              "method": "post",
-              "body": "@body('Create_Chunk_CSV')",
-              "headers": {
-                "ReadFileMetadataFromServer": true
-              },
-              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
-              "queries": {
-                "folderPath": "reportoutput",
-                "name": "@{items('Process_Time_Chunks')['blobName']}",
-                "queryParametersSingleEncoded": true
-              }
-            },
-            "runAfter": {
-              "Delete_Existing_Blob": [
-                "Succeeded",
-                "Failed"
-              ]
-            },
-            "runtimeConfiguration": {
-              "contentTransfer": {
-                "transferMode": "Chunked"
-              }
-            }
           }
         },
         "runAfter": {
-          "Initialize_Time_Chunks": [
+          "Initialize_Final_Results": [
             "Succeeded"
           ]
         },
@@ -288,6 +310,144 @@
           "concurrency": {
             "repetitions": 1
           }
+        }
+      },
+      "Aggregate_All_Results": {
+        "type": "Foreach",
+        "description": "Aggregate rows by composite key (ProductId|Deployment|Endpoint etc.), summing tokens and calls.",
+        "foreach": "@variables('AllResults')",
+        "actions": {
+          "Build_Composite_Key": {
+            "type": "Compose",
+            "inputs": "@concat(coalesce(items('Aggregate_All_Results')['ProductId'], ''), '|', coalesce(items('Aggregate_All_Results')['Luma'], ''), '|', coalesce(items('Aggregate_All_Results')['Workspace'], ''), '|', coalesce(items('Aggregate_All_Results')['DeploymentName'], ''), '|', coalesce(items('Aggregate_All_Results')['ModelName'], ''), '|', coalesce(items('Aggregate_All_Results')['AccountName'], ''), '|', coalesce(items('Aggregate_All_Results')['SubscriptionId'], ''), '|', coalesce(items('Aggregate_All_Results')['BackendId'], ''), '|', coalesce(items('Aggregate_All_Results')['Endpoint'], ''), '|', coalesce(items('Aggregate_All_Results')['SkuName'], ''), '|', coalesce(string(items('Aggregate_All_Results')['SkuCapacity']), ''))"
+          },
+          "Check_Key_Exists": {
+            "type": "If",
+            "expression": {
+              "and": [
+                {
+                  "contains": [
+                    "@variables('SeenKeys')",
+                    "@outputs('Build_Composite_Key')"
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "Update_Existing_Row": {
+                "type": "SetVariable",
+                "inputs": {
+                  "name": "AggregatedData",
+                  "value": "@setProperty(variables('AggregatedData'), outputs('Build_Composite_Key'), json(concat('{\"ProductId\":\"', coalesce(items('Aggregate_All_Results')['ProductId'], ''), '\",\"Luma\":\"', coalesce(items('Aggregate_All_Results')['Luma'], ''), '\",\"Workspace\":\"', coalesce(items('Aggregate_All_Results')['Workspace'], ''), '\",\"DeploymentName\":\"', coalesce(items('Aggregate_All_Results')['DeploymentName'], ''), '\",\"ModelName\":\"', coalesce(items('Aggregate_All_Results')['ModelName'], ''), '\",\"AccountName\":\"', coalesce(items('Aggregate_All_Results')['AccountName'], ''), '\",\"SubscriptionId\":\"', coalesce(items('Aggregate_All_Results')['SubscriptionId'], ''), '\",\"SkuName\":\"', coalesce(items('Aggregate_All_Results')['SkuName'], ''), '\",\"SkuCapacity\":', coalesce(string(items('Aggregate_All_Results')['SkuCapacity']), 'null'), ',\"BackendId\":\"', coalesce(items('Aggregate_All_Results')['BackendId'], ''), '\",\"Endpoint\":\"', coalesce(items('Aggregate_All_Results')['Endpoint'], ''), '\",\"PromptTokens\":', string(add(int(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['PromptTokens'], 0)), int(coalesce(items('Aggregate_All_Results')['PromptTokens'], 0)))), ',\"CompletionTokens\":', string(add(int(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['CompletionTokens'], 0)), int(coalesce(items('Aggregate_All_Results')['CompletionTokens'], 0)))), ',\"TotalTokens\":', string(add(int(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['TotalTokens'], 0)), int(coalesce(items('Aggregate_All_Results')['TotalTokens'], 0)))), ',\"Calls\":', string(add(int(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['Calls'], 0)), int(coalesce(items('Aggregate_All_Results')['Calls'], 0)))), ',\"FirstSeen\":\"', if(less(ticks(coalesce(items('Aggregate_All_Results')['FirstSeen'], '9999-12-31T23:59:59Z')), ticks(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['FirstSeen'], '9999-12-31T23:59:59Z'))), items('Aggregate_All_Results')['FirstSeen'], variables('AggregatedData')[outputs('Build_Composite_Key')]?['FirstSeen']), '\",\"LastSeen\":\"', if(greater(ticks(coalesce(items('Aggregate_All_Results')['LastSeen'], '0001-01-01T00:00:00Z')), ticks(coalesce(variables('AggregatedData')[outputs('Build_Composite_Key')]?['LastSeen'], '0001-01-01T00:00:00Z'))), items('Aggregate_All_Results')['LastSeen'], variables('AggregatedData')[outputs('Build_Composite_Key')]?['LastSeen']), '\",\"Regions\":\"', coalesce(items('Aggregate_All_Results')['Regions'], ''), '\",\"CallerIpAddresses\":\"', coalesce(items('Aggregate_All_Results')['CallerIpAddresses'], ''), '\"}')))"
+                }
+              }
+            },
+            "else": {
+              "actions": {
+                "Add_New_Key": {
+                  "type": "AppendToArrayVariable",
+                  "inputs": {
+                    "name": "SeenKeys",
+                    "value": "@outputs('Build_Composite_Key')"
+                  }
+                },
+                "Add_New_Row": {
+                  "type": "SetVariable",
+                  "inputs": {
+                    "name": "AggregatedData",
+                    "value": "@setProperty(variables('AggregatedData'), outputs('Build_Composite_Key'), items('Aggregate_All_Results'))"
+                  },
+                  "runAfter": {
+                    "Add_New_Key": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              }
+            },
+            "runAfter": {
+              "Build_Composite_Key": [
+                "Succeeded"
+              ]
+            }
+          }
+        },
+        "runAfter": {
+          "Process_Time_Chunks": [
+            "Succeeded"
+          ]
+        },
+        "runtimeConfiguration": {
+          "concurrency": {
+            "repetitions": 1
+          }
+        }
+      },
+      "Build_Final_Array": {
+        "type": "Foreach",
+        "description": "Convert aggregated object to array for CSV generation.",
+        "foreach": "@variables('SeenKeys')",
+        "actions": {
+          "Append_Aggregated_Row": {
+            "type": "AppendToArrayVariable",
+            "inputs": {
+              "name": "FinalResults",
+              "value": "@variables('AggregatedData')[items('Build_Final_Array')]"
+            }
+          }
+        },
+        "runAfter": {
+          "Aggregate_All_Results": [
+            "Succeeded"
+          ]
+        },
+        "runtimeConfiguration": {
+          "concurrency": {
+            "repetitions": 1
+          }
+        }
+      },
+      "Create_blob_(V2)": {
+        "type": "ApiConnection",
+        "inputs": {
+          "host": {
+            "connection": {
+              "referenceName": "azureblob"
+            }
+          },
+          "method": "post",
+          "body": "@body('Create_CSV_table')",
+          "headers": {
+            "ReadFileMetadataFromServer": true
+          },
+          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
+          "queries": {
+            "folderPath": "reportoutput",
+            "name": "dailyChargeBackReport.csv",
+            "queryParametersSingleEncoded": true
+          }
+        },
+        "runAfter": {
+          "Create_CSV_table": [
+            "Succeeded"
+          ]
+        },
+        "runtimeConfiguration": {
+          "contentTransfer": {
+            "transferMode": "Chunked"
+          }
+        }
+      },
+      "Create_CSV_table": {
+        "type": "Table",
+        "inputs": {
+          "from": "@variables('FinalResults')",
+          "format": "CSV"
+        },
+        "runAfter": {
+          "Build_Final_Array": [
+            "Succeeded"
+          ]
         }
       },
       "Handle_Query_Failure": {
@@ -319,6 +479,7 @@
         },
         "runAfter": {
           "Process_Time_Chunks": [
+            "TimedOut",
             "Failed"
           ]
         }
@@ -337,11 +498,11 @@
               "WorkflowName": "@{workflow().name}",
               "WorkflowRunId": "@{workflow().run.id}",
               "FailureType": "BlobWriteFailure",
-              "ActionName": "Write_Chunk_Blob",
-              "ErrorCode": "BlobWriteError",
-              "ErrorMessage": "Failed to write one or more chunk blobs.",
-              "Severity": "High",
-              "BlobPath": "reportoutput/"
+              "ActionName": "Create_blob_(V2)",
+              "BlobPath": "reportoutput/dailyChargeBackReport.csv",
+              "ErrorCode": "@{actions('Create_blob_(V2)')?['error']?['code']}",
+              "ErrorMessage": "@{actions('Create_blob_(V2)')?['error']?['message']}",
+              "Severity": "High"
             }
           ],
           "authentication": {
@@ -351,13 +512,35 @@
           }
         },
         "runAfter": {
-          "Process_Time_Chunks": [
-            "Succeeded",
+          "Create_blob_(V2)": [
+            "TimedOut",
+            "Skipped",
             "Failed"
           ]
         }
       }
-    }
+    },
+    "outputs": {}
   },
-  "kind": "Stateful"
+  "kind": "stateful"
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
