@@ -100,14 +100,35 @@ Write-Host "  This will create: App Service Plan, Logic App (with managed identi
 
 $deploymentName = "chargebackInfra-$(Get-Date -Format 'yyyyMMddHHmmss')"
 
-$deploymentOutput = az deployment group create `
+# Capture raw output to diagnose errors
+$rawOutput = az deployment group create `
     --name $deploymentName `
     --resource-group $ResourceGroupName `
     --parameters $parametersFilePath `
-    --output json | ConvertFrom-Json
+    --output json 2>&1
 
-if ($LASTEXITCODE -ne 0 -or -not $deploymentOutput) {
+if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Infrastructure deployment failed" -ForegroundColor Red
+    Write-Host "Raw output: $rawOutput" -ForegroundColor Yellow
+    exit 1
+}
+
+try {
+    # Strip any non-JSON prefix (e.g., "Bicep CLI is already installed..." messages)
+    $jsonOutput = $rawOutput -join "`n"
+    if ($jsonOutput -match '(?s)(\{.*\})') {
+        $jsonOutput = $Matches[1]
+    }
+    $deploymentOutput = $jsonOutput | ConvertFrom-Json
+}
+catch {
+    Write-Host "ERROR: Failed to parse deployment output as JSON" -ForegroundColor Red
+    Write-Host "Raw output: $rawOutput" -ForegroundColor Yellow
+    exit 1
+}
+
+if (-not $deploymentOutput) {
+    Write-Host "ERROR: Infrastructure deployment returned no output" -ForegroundColor Red
     exit 1
 }
 
@@ -388,7 +409,27 @@ Write-Host "✓ Workflow and connections updated" -ForegroundColor Green
 
 Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
 Set-Location $PSScriptRoot
-func azure functionapp publish $LogicAppName --output none
+
+# Check if Azure Functions Core Tools is installed
+$funcVersion = func --version 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Azure Functions Core Tools (func) is not installed or not in PATH" -ForegroundColor Red
+    Write-Host "Install it with: npm install -g azure-functions-core-tools@4" -ForegroundColor Yellow
+    Write-Host "Or download from: https://docs.microsoft.com/en-us/azure/azure-functions/functions-run-local" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "  Using Azure Functions Core Tools version: $funcVersion" -ForegroundColor Gray
+
+# Deploy workflow - capture output to show errors
+Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
+$publishOutput = func azure functionapp publish $LogicAppName 2>&1
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
+    Write-Host "Output: $publishOutput" -ForegroundColor Yellow
+    exit 1
+}
+
 Write-Host "✓ Workflow deployed" -ForegroundColor Green
 
 Write-Host "`nStep 8: Restarting Logic App to apply permissions..." -ForegroundColor Cyan

@@ -13,3 +13,18 @@ __azurite_db*__.json
 workflow-designtime/
 .vscode/
 *.code-workspace
+
+# Deployment parameters (contains environment-specific values)
+deploy-infrastructure.bicepparam
+
+# Deployment artifacts
+deploy.zip
+deployed.json
+
+# Test/debug files
+chunk*.csv
+report*.csv
+workflow-check.json
+
+# OneDrive sync conflict files
+*-DESKTOP-*.json

@@ -9,13 +9,13 @@
       },
       "authentication": {
         "type": "ManagedServiceIdentity",
-        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
+        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q"
       },
-      "connectionRuntimeUrl": "{{AZURE_MONITOR_LOGS_RUNTIME_URL}}",
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azuremonitorlogs/cc26991e093647569de3dd7749266dfe",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
-          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
           "audience": "https://management.core.windows.net/",
           "additionalAudiences": [
             "https://api.loganalytics.io"
@@ -32,13 +32,13 @@
       },
       "authentication": {
         "type": "ManagedServiceIdentity",
-        "identity": "{{USER_MANAGED_IDENTITY_ID}}"
+        "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q"
       },
-      "connectionRuntimeUrl": "{{AZURE_BLOB_RUNTIME_URL}}",
+      "connectionRuntimeUrl": "https://c18e032e95567c04.14.common.logic-eastus2.azure-apihub.net/apim/azureblob/261a271a40b0444ca4f327c1e8b2cf14",
       "connectionProperties": {
         "authentication": {
           "type": "ManagedServiceIdentity",
-          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
           "audience": "https://storage.azure.com/"
         }
       }
@@ -47,6 +47,8 @@
   "serviceProviderConnections": {},
   "agentConnections": {}
 }
+
+
 
 
 

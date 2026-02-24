@@ -14,216 +14,286 @@
       }
     },
     "actions": {
-      "Submit_Async_Query": {
-        "type": "Http",
-        "description": "Submit the Log Analytics query asynchronously using Prefer: wait=0 to avoid HTTP timeout on long-running queries.",
+      "Initialize_Time_Chunks": {
+        "type": "InitializeVariable",
+        "description": "Create 12 x 2-hour time chunks. Each chunk outputs to its own blob.",
         "inputs": {
-          "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('LOG_ANALYTICS_WORKSPACE_ID')}/query",
-          "method": "POST",
-          "headers": {
-            "Content-Type": "application/json",
-            "Prefer": "wait=0"
-          },
-          "body": {
-            "query": "let startTime = startofday(now()) - 3h; let endTime = startofday(now()) + 21h; ApiManagementGatewayLogs | where TimeGenerated >= startTime and TimeGenerated < endTime | join kind=inner ApiManagementGatewayLlmLog on CorrelationId | where SequenceNumber == 0 and IsRequestSuccess | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = make_set(Region, 8), CallerIpAddresses = make_set(CallerIpAddress, 8), Caches = make_set(Cache, 8), BackendIds = make_set(BackendId, 8), Calls = count() by ProductId, ModelName | project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds | order by TotalTokens desc"
-          },
-          "authentication": {
-            "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
-            "audience": "https://api.loganalytics.io"
-          }
-        },
-        "runAfter": {},
-        "runtimeConfiguration": {
-          "contentTransfer": {
-            "transferMode": "Chunked"
-          }
-        }
-      },
-      "Check_If_Query_Completed_Synchronously": {
-        "type": "If",
-        "description": "If the API returned 200, the query completed synchronously â€” skip polling. If 202, we need to poll.",
-        "expression": {
-          "and": [
+          "variables": [
             {
-              "equals": [
-                "@outputs('Submit_Async_Query')['statusCode']",
-                200
+              "name": "TimeChunks",
+              "type": "array",
+              "value": [
+                { "chunkId": 1, "hoursAgo": 24, "hoursUntil": 22, "blobName": "chargeBack-chunk-01-21h-23h.csv" },
+                { "chunkId": 2, "hoursAgo": 22, "hoursUntil": 20, "blobName": "chargeBack-chunk-02-23h-01h.csv" },
+                { "chunkId": 3, "hoursAgo": 20, "hoursUntil": 18, "blobName": "chargeBack-chunk-03-01h-03h.csv" },
+                { "chunkId": 4, "hoursAgo": 18, "hoursUntil": 16, "blobName": "chargeBack-chunk-04-03h-05h.csv" },
+                { "chunkId": 5, "hoursAgo": 16, "hoursUntil": 14, "blobName": "chargeBack-chunk-05-05h-07h.csv" },
+                { "chunkId": 6, "hoursAgo": 14, "hoursUntil": 12, "blobName": "chargeBack-chunk-06-07h-09h.csv" },
+                { "chunkId": 7, "hoursAgo": 12, "hoursUntil": 10, "blobName": "chargeBack-chunk-07-09h-11h.csv" },
+                { "chunkId": 8, "hoursAgo": 10, "hoursUntil": 8, "blobName": "chargeBack-chunk-08-11h-13h.csv" },
+                { "chunkId": 9, "hoursAgo": 8, "hoursUntil": 6, "blobName": "chargeBack-chunk-09-13h-15h.csv" },
+                { "chunkId": 10, "hoursAgo": 6, "hoursUntil": 4, "blobName": "chargeBack-chunk-10-15h-17h.csv" },
+                { "chunkId": 11, "hoursAgo": 4, "hoursUntil": 2, "blobName": "chargeBack-chunk-11-17h-19h.csv" },
+                { "chunkId": 12, "hoursAgo": 2, "hoursUntil": 0, "blobName": "chargeBack-chunk-12-19h-21h.csv" }
               ]
             }
           ]
         },
+        "runAfter": {}
+      },
+      "Process_Time_Chunks": {
+        "type": "Foreach",
+        "description": "Process each 2-hour chunk: query, transform, create CSV, write blob.",
+        "foreach": "@variables('TimeChunks')",
         "actions": {
-          "Set_Sync_Results": {
-            "type": "Compose",
-            "inputs": "@body('Submit_Async_Query')"
-          }
-        },
-        "else": {
-          "actions": {
-            "Initialize_Poll_Location": {
-              "type": "Compose",
-              "description": "Capture the Location header URL returned by the 202 response for polling.",
-              "inputs": "@outputs('Submit_Async_Query')['headers']?['location']",
-              "runAfter": {}
-            },
-            "Wait_Before_First_Poll": {
-              "type": "Wait",
-              "inputs": {
-                "interval": {
-                  "count": 10,
-                  "unit": "Second"
-                }
+          "Submit_Chunk_Query": {
+            "type": "Http",
+            "description": "Submit the Log Analytics query for this time chunk.",
+            "inputs": {
+              "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('LOG_ANALYTICS_WORKSPACE_ID')}/query",
+              "method": "POST",
+              "headers": {
+                "Content-Type": "application/json",
+                "Prefer": "wait=0"
               },
-              "runAfter": {
-                "Initialize_Poll_Location": [
-                  "Succeeded"
-                ]
+              "body": {
+                "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now() - 1d)); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
+              },
+              "authentication": {
+                "type": "ManagedServiceIdentity",
+                "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                "audience": "https://api.loganalytics.io"
               }
             },
-            "Poll_For_Query_Results": {
-              "type": "Until",
-              "description": "Poll the Location URL until the query completes (status 200) or we exceed the timeout.",
-              "expression": "@equals(outputs('Check_Query_Status')['statusCode'], 200)",
-              "limit": {
-                "count": 60,
-                "timeout": "PT30M"
-              },
+            "runAfter": {},
+            "runtimeConfiguration": {
+              "contentTransfer": {
+                "transferMode": "Chunked"
+              }
+            }
+          },
+          "Check_Chunk_Sync_Or_Async": {
+            "type": "If",
+            "description": "If 200, query completed synchronously. If 202, poll for results.",
+            "expression": {
+              "and": [
+                {
+                  "equals": [
+                    "@outputs('Submit_Chunk_Query')['statusCode']",
+                    200
+                  ]
+                }
+              ]
+            },
+            "actions": {
+              "Set_Chunk_Sync_Results": {
+                "type": "Compose",
+                "inputs": "@body('Submit_Chunk_Query')"
+              }
+            },
+            "else": {
               "actions": {
-                "Check_Query_Status": {
-                  "type": "Http",
-                  "inputs": {
-                    "uri": "@{outputs('Initialize_Poll_Location')}",
-                    "method": "GET",
-                    "authentication": {
-                      "type": "ManagedServiceIdentity",
-                      "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
-                      "audience": "https://api.loganalytics.io"
-                    }
-                  },
+                "Get_Poll_Location": {
+                  "type": "Compose",
+                  "inputs": "@outputs('Submit_Chunk_Query')['headers']?['location']",
                   "runAfter": {}
                 },
-                "Delay_Between_Polls": {
+                "Wait_Before_Poll": {
                   "type": "Wait",
                   "inputs": {
                     "interval": {
-                      "count": 15,
+                      "count": 10,
                       "unit": "Second"
                     }
                   },
                   "runAfter": {
-                    "Check_Query_Status": [
+                    "Get_Poll_Location": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Poll_Chunk_Results": {
+                  "type": "Until",
+                  "expression": "@not(equals(outputs('Check_Chunk_Status')['statusCode'], 202))",
+                  "limit": {
+                    "count": 60,
+                    "timeout": "PT10M"
+                  },
+                  "actions": {
+                    "Check_Chunk_Status": {
+                      "type": "Http",
+                      "inputs": {
+                        "uri": "@outputs('Get_Poll_Location')",
+                        "method": "GET",
+                        "authentication": {
+                          "type": "ManagedServiceIdentity",
+                          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                          "audience": "https://api.loganalytics.io"
+                        }
+                      },
+                      "runAfter": {}
+                    },
+                    "Delay_Chunk_Poll": {
+                      "type": "Wait",
+                      "inputs": {
+                        "interval": {
+                          "count": 5,
+                          "unit": "Second"
+                        }
+                      },
+                      "runAfter": {
+                        "Check_Chunk_Status": [
+                          "Succeeded"
+                        ]
+                      }
+                    }
+                  },
+                  "runAfter": {
+                    "Wait_Before_Poll": [
+                      "Succeeded"
+                    ]
+                  }
+                },
+                "Set_Chunk_Async_Results": {
+                  "type": "Compose",
+                  "inputs": "@body('Check_Chunk_Status')",
+                  "runAfter": {
+                    "Poll_Chunk_Results": [
                       "Succeeded"
                     ]
                   }
                 }
-              },
-              "runAfter": {
-                "Wait_Before_First_Poll": [
-                  "Succeeded"
-                ]
               }
             },
-            "Set_Async_Results": {
-              "type": "Compose",
-              "inputs": "@body('Check_Query_Status')",
-              "runAfter": {
-                "Poll_For_Query_Results": [
-                  "Succeeded"
-                ]
+            "runAfter": {
+              "Submit_Chunk_Query": [
+                "Succeeded"
+              ]
+            }
+          },
+          "Get_Chunk_Results": {
+            "type": "Compose",
+            "description": "Get the final query results (from sync or async path).",
+            "inputs": "@if(equals(outputs('Submit_Chunk_Query')['statusCode'], 200), outputs('Set_Chunk_Sync_Results'), outputs('Set_Chunk_Async_Results'))",
+            "runAfter": {
+              "Check_Chunk_Sync_Or_Async": [
+                "Succeeded"
+              ]
+            }
+          },
+          "Transform_Chunk_To_Objects": {
+            "type": "Select",
+            "description": "Transform each row array to a named object.",
+            "inputs": {
+              "from": "@if(equals(outputs('Get_Chunk_Results')?['tables']?[0]?['rows'], null), json('[]'), outputs('Get_Chunk_Results')?['tables']?[0]?['rows'])",
+              "select": {
+                "ProductId": "@item()[0]",
+                "Luma": "@item()[1]",
+                "Workspace": "@item()[2]",
+                "DeploymentName": "@item()[3]",
+                "ModelName": "@item()[4]",
+                "AccountName": "@item()[5]",
+                "SubscriptionId": "@item()[6]",
+                "SkuName": "@item()[7]",
+                "SkuCapacity": "@item()[8]",
+                "BackendId": "@item()[9]",
+                "Endpoint": "@item()[10]",
+                "PromptTokens": "@item()[11]",
+                "CompletionTokens": "@item()[12]",
+                "TotalTokens": "@item()[13]",
+                "Calls": "@item()[14]",
+                "FirstSeen": "@item()[15]",
+                "LastSeen": "@item()[16]",
+                "Regions": "@item()[17]",
+                "CallerIpAddresses": "@item()[18]"
+              }
+            },
+            "runAfter": {
+              "Get_Chunk_Results": [
+                "Succeeded"
+              ]
+            }
+          },
+          "Create_Chunk_CSV": {
+            "type": "Table",
+            "description": "Create CSV from this chunk's data.",
+            "inputs": {
+              "from": "@body('Transform_Chunk_To_Objects')",
+              "format": "CSV"
+            },
+            "runAfter": {
+              "Transform_Chunk_To_Objects": [
+                "Succeeded"
+              ]
+            }
+          },
+          "Delete_Existing_Blob": {
+            "type": "ApiConnection",
+            "description": "Delete existing blob if present (to allow overwrite).",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "referenceName": "azureblob"
+                }
+              },
+              "method": "delete",
+              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files/@{encodeURIComponent(encodeURIComponent(concat('reportoutput/', items('Process_Time_Chunks')['blobName'])))}"
+            },
+            "runAfter": {
+              "Create_Chunk_CSV": [
+                "Succeeded"
+              ]
+            }
+          },
+          "Write_Chunk_Blob": {
+            "type": "ApiConnection",
+            "description": "Write this chunk's CSV to blob storage.",
+            "inputs": {
+              "host": {
+                "connection": {
+                  "referenceName": "azureblob"
+                }
+              },
+              "method": "post",
+              "body": "@body('Create_Chunk_CSV')",
+              "headers": {
+                "ReadFileMetadataFromServer": true
+              },
+              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
+              "queries": {
+                "folderPath": "reportoutput",
+                "name": "@{items('Process_Time_Chunks')['blobName']}",
+                "queryParametersSingleEncoded": true
+              }
+            },
+            "runAfter": {
+              "Delete_Existing_Blob": [
+                "Succeeded",
+                "Failed"
+              ]
+            },
+            "runtimeConfiguration": {
+              "contentTransfer": {
+                "transferMode": "Chunked"
               }
             }
           }
         },
         "runAfter": {
-          "Submit_Async_Query": [
-            "Succeeded"
-          ]
-        }
-      },
-      "Transform_Query_Results_To_Rows": {
-        "type": "Select",
-        "description": "Transform the Log Analytics columnar response into named objects. Column order matches the KQL project clause: ProductId(0), ModelName(1), PromptTokens(2), CompletionTokens(3), TotalTokens(4), Calls(5), FirstSeen(6), LastSeen(7), Regions(8), CallerIpAddresses(9), Caches(10), BackendIds(11).",
-        "inputs": {
-          "from": "@outputs('Merge_Query_Results')?['tables']?[0]?['rows']",
-          "select": {
-            "ProductId": "@item()[0]",
-            "ModelName": "@item()[1]",
-            "PromptTokens": "@item()[2]",
-            "CompletionTokens": "@item()[3]",
-            "TotalTokens": "@item()[4]",
-            "Calls": "@item()[5]",
-            "FirstSeen": "@item()[6]",
-            "LastSeen": "@item()[7]",
-            "Regions": "@item()[8]",
-            "CallerIpAddresses": "@item()[9]",
-            "Caches": "@item()[10]",
-            "BackendIds": "@item()[11]"
-          }
-        },
-        "runAfter": {
-          "Merge_Query_Results": [
-            "Succeeded"
-          ]
-        }
-      },
-      "Merge_Query_Results": {
-        "type": "Compose",
-        "description": "Select the final query result body, whether it came from the synchronous or asynchronous path.",
-        "inputs": "@if(equals(outputs('Submit_Async_Query')['statusCode'], 200), outputs('Set_Sync_Results'), outputs('Set_Async_Results'))",
-        "runAfter": {
-          "Check_If_Query_Completed_Synchronously": [
-            "Succeeded"
-          ]
-        }
-      },
-      "Create_blob_(V2)": {
-        "type": "ApiConnection",
-        "inputs": {
-          "host": {
-            "connection": {
-              "referenceName": "azureblob"
-            }
-          },
-          "method": "post",
-          "body": "@body('Create_CSV_table')",
-          "headers": {
-            "ReadFileMetadataFromServer": true
-          },
-          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
-          "queries": {
-            "folderPath": "reportoutput",
-            "name": "dailyChargeBackReport.csv",
-            "queryParametersSingleEncoded": true
-          }
-        },
-        "runAfter": {
-          "Create_CSV_table": [
+          "Initialize_Time_Chunks": [
             "Succeeded"
           ]
         },
         "runtimeConfiguration": {
-          "contentTransfer": {
-            "transferMode": "Chunked"
+          "concurrency": {
+            "repetitions": 1
           }
-        }
-      },
-      "Create_CSV_table": {
-        "type": "Table",
-        "inputs": {
-          "from": "@body('Transform_Query_Results_To_Rows')",
-          "format": "CSV"
-        },
-        "runAfter": {
-          "Transform_Query_Results_To_Rows": [
-            "Succeeded"
-          ]
         }
       },
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-ojxkavsiozn4y-y56m.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-070950e93f33496dbdd06580ac38df19/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -234,26 +304,21 @@
               "WorkflowName": "@{workflow().name}",
               "WorkflowRunId": "@{workflow().run.id}",
               "FailureType": "QueryFailure",
-              "ActionName": "Submit_Async_Query",
-              "ErrorCode": "@{coalesce(actions('Submit_Async_Query')?['error']?['code'], actions('Check_Query_Status')?['error']?['code'], 'Unknown')}",
-              "ErrorMessage": "@{coalesce(actions('Submit_Async_Query')?['error']?['message'], actions('Check_Query_Status')?['error']?['message'], 'Query failed or timed out during async execution')}",
+              "ActionName": "Process_Time_Chunks",
+              "ErrorCode": "ChunkQueryFailure",
+              "ErrorMessage": "One or more time chunk queries failed during execution.",
               "Severity": "High",
               "BlobPath": ""
             }
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
             "audience": "https://monitor.azure.com"
           }
         },
         "runAfter": {
-          "Submit_Async_Query": [
-            "TimedOut",
-            "Failed"
-          ],
-          "Check_If_Query_Completed_Synchronously": [
-            "TimedOut",
+          "Process_Time_Chunks": [
             "Failed"
           ]
         }
@@ -261,7 +326,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-ojxkavsiozn4y-y56m.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-070950e93f33496dbdd06580ac38df19/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -272,48 +337,27 @@
               "WorkflowName": "@{workflow().name}",
               "WorkflowRunId": "@{workflow().run.id}",
               "FailureType": "BlobWriteFailure",
-              "ActionName": "Create_blob_(V2)",
-              "BlobPath": "reportoutput/dailyChargeBackReport.csv",
-              "ErrorCode": "@{actions('Create_blob_(V2)')?['error']?['code']}",
-              "ErrorMessage": "@{actions('Create_blob_(V2)')?['error']?['message']}",
-              "Severity": "High"
+              "ActionName": "Write_Chunk_Blob",
+              "ErrorCode": "BlobWriteError",
+              "ErrorMessage": "Failed to write one or more chunk blobs.",
+              "Severity": "High",
+              "BlobPath": "reportoutput/"
             }
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/AIHubChargeBack/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-ojxkavsiozn4y",
+            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
             "audience": "https://monitor.azure.com"
           }
         },
         "runAfter": {
-          "Create_blob_(V2)": [
-            "TimedOut",
-            "Skipped",
+          "Process_Time_Chunks": [
+            "Succeeded",
             "Failed"
           ]
         }
       }
-    },
-    "outputs": {}
+    }
   },
-  "kind": "stateful"
+  "kind": "Stateful"
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

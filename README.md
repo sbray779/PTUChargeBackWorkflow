@@ -23,21 +23,38 @@ The solution uses **Bicep templates** and **PowerShell** to deploy a complete in
 
 ## Workflow Overview
 
-The `CreateChargeBackReport` workflow uses an **asynchronous query pattern** against the Log Analytics REST API to avoid HTTP timeouts on long-running queries:
+The `CreateChargeBackReport` workflow uses a **time-chunked query pattern** to avoid Log Analytics memory limits (5GB) on large datasets. Instead of running a single 24-hour query, it splits the time range into **12 x 2-hour chunks** and writes each chunk's results to a separate blob file:
 
-1. **Submit_Async_Query** — Sends the KQL query to the Log Analytics REST API with `Prefer: wait=0` header, which returns immediately with either a `200` (results ready) or `202` (query accepted, poll for results)
-2. **Check_If_Query_Completed_Synchronously** — Branches based on the HTTP status code:
-   - **200 path**: Results returned inline → `Set_Sync_Results`
-   - **202 path**: Captures the `Location` header → waits 10 seconds → enters polling loop
-3. **Poll_For_Query_Results** — An Until loop that polls the Location URL every 15 seconds (up to 60 iterations / 30 minutes) via `Check_Query_Status` until the query completes with HTTP 200
-4. **Merge_Query_Results** — Selects the final result body from whichever path was taken
-5. **Transform_Query_Results_To_Rows** — Converts the columnar Log Analytics response (`tables[0].rows`) into named objects using positional array indexes matching the KQL `project` clause
-6. **Create_CSV_table** — Converts the row objects to CSV format
-7. **Create_blob_(V2)** — Uploads the CSV to blob storage at `reportoutput/dailyChargeBackReport.csv`
+1. **Initialize_Time_Chunks** — Creates an array of 12 time chunks, each covering 2 hours with a `blobName` property (e.g., `chargeBack-chunk-01-21h-23h.csv`)
+2. **Process_Time_Chunks** (ForEach loop, sequential) — For each chunk:
+   - **Submit_Chunk_Query** — Sends KQL query with `Prefer: wait=0` for async execution
+   - **Check_Chunk_Sync_Or_Async** — Branches on HTTP 200 (sync) vs 202 (async):
+     - **200 path**: `Set_Chunk_Sync_Results` captures inline results
+     - **202 path**: `Get_Poll_Location` → `Wait_Before_Poll` → `Poll_Chunk_Results` loop
+   - **Get_Chunk_Results** — Selects final results from whichever path completed
+   - **Transform_Chunk_To_Objects** — Converts columnar query results to named objects
+   - **Create_Chunk_CSV** — Converts chunk results to CSV format
+   - **Delete_Existing_Blob** — Removes existing blob (allows overwrite)
+   - **Write_Chunk_Blob** — Creates new blob with chunk data
+
+**Output Files** — 12 separate CSV files per run:
+- `chargeBack-chunk-01-21h-23h.csv` through `chargeBack-chunk-12-19h-21h.csv`
+- Each file contains pre-aggregated data for its 2-hour window
+- Files are overwritten on each subsequent run
 
 **Error Handlers** (run on failure/timeout of upstream actions):
 - **Handle_Query_Failure** — Logs query errors to a custom Log Analytics table via Data Collection Rules
 - **Handle_Blob_Write_Failure** — Logs blob write errors to the same custom table
+
+### Why Time Chunking + Separate Blobs?
+
+Log Analytics queries have a 5GB memory limit for joins. With high-volume APIM traffic, joining `ApiManagementGatewayLogs` with `ApiManagementGatewayLlmLog` over 24 hours can exceed this limit, resulting in error `-2133196799`. By splitting into 2-hour chunks:
+- Each chunk stays under the memory limit
+- The `hint.strategy=shuffle` hint distributes join processing across nodes
+- Each chunk is pre-aggregated in KQL before writing to blob
+- Downstream consumers can aggregate across chunk files as needed
+
+This approach is a pure Logic App solution with no external dependencies on Azure Functions or JavaScript code actions, ensuring compatibility with .NET-based Logic App Standard runtimes
 
 ## Prerequisites
 
@@ -106,7 +123,7 @@ The script executes 8 steps automatically:
      --uri "https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{logicAppName}/hostruntime/runtime/webhooks/workflow/api/management/workflows/CreateChargeBackReport/triggers/Recurrence/run?api-version=2024-04-01"
    ```
 4. Check run history for success/failure
-5. Verify the CSV appears in storage: `rptcb{suffix}/reportoutput/dailyChargeBackReport.csv`
+5. Verify the 12 chunk CSV files appear in storage: `rptcb{suffix}/reportoutput/chargeBack-chunk-*.csv`
 
 ## Deployment (Workflow Only — Existing Logic App)
 
@@ -176,12 +193,12 @@ az logicapp restart --name <your-logic-app-name> --resource-group <your-resource
 
 | Resource | Name Pattern | Purpose |
 |----------|-------------|---------|
-| App Service Plan | `asp-chargeback-{suffix}` | WS1 SKU for Logic Apps Standard |
+| App Service Plan (Logic App) | `asp-chargeback-{suffix}` | WS1 SKU for Logic Apps Standard |
 | User-Assigned Managed Identity | `id-chargeback-{suffix}` | Centralized authentication for all services |
 | Logic App | `logic-chargeback-{suffix}` | Workflow engine |
 | Logic App Storage | `lacb{suffix}` | Internal runtime storage (key-based auth required) |
 | Report Storage | `rptcb{suffix}` | CSV report output (managed identity only, no keys) |
-| Blob Container | `reportoutput` | Container for daily CSV reports |
+| Blob Container | `reportoutput` | Container for 12 daily chunk CSV reports |
 | Log Analytics Workspace | `law-chargeback-{suffix}` | Error logging |
 | Custom Table | `WorkflowFailures_CL` | Schema for workflow error records |
 | Data Collection Endpoint | `dce-chargeback-{suffix}` | Log ingestion endpoint |
@@ -209,117 +226,189 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│ Resource Group                                                  │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────────────┐                                          │
-│  │  User-Assigned   │◀─── Used by Logic App & API Connections  │
-│  │ Managed Identity │                                          │
-│  └────────┬─────────┘                                          │
-│           │                                                     │
-│           ▼                                                     │
-│  ┌──────────────────────────────────────────────┐              │
-│  │ Logic App (Standard)                         │              │
-│  │                                              │              │
-│  │  ┌─ CreateChargeBackReport ───────────────┐  │              │
-│  │  │ Recurrence Trigger (every 24h)         │  │              │
-│  │  │        │                               │  │              │
-│  │  │        ▼                               │  │              │
-│  │  │ Submit_Async_Query (HTTP POST)         │  │              │
-│  │  │ Prefer: wait=0                        │  │              │
-│  │  │        │                               │  │              │
-│  │  │    ┌───┴───┐                           │  │              │
-│  │  │  200?    202?                          │  │              │
-│  │  │    │       │                           │  │              │
-│  │  │  Sync   Poll_For_Query_Results         │  │              │
-│  │  │  Path   (Until loop, 15s intervals)    │  │              │
-│  │  │    │       │                           │  │              │
-│  │  │    └───┬───┘                           │  │              │
-│  │  │        ▼                               │  │              │
-│  │  │ Merge_Query_Results                    │  │              │
-│  │  │        ▼                               │  │              │
-│  │  │ Transform_Query_Results_To_Rows        │  │              │
-│  │  │ (Select: @item()[0]..@item()[11])      │  │              │
-│  │  │        ▼                               │  │              │
-│  │  │ Create_CSV_table → Create_blob_(V2)    │  │              │
-│  │  └────────────────────────────────────────┘  │              │
-│  └──────────────────────────────────────────────┘              │
-│           │                            │                       │
-│           ▼                            ▼                       │
-│  ┌──────────────────┐  ┌──────────────────┐                   │
-│  │ Storage (lacb*)  │  │ Storage (rptcb*) │                   │
-│  │ Internal/Runtime │  │ reportoutput/    │                   │
-│  │ (Key Auth)       │  │ dailyChargeback  │                   │
-│  └──────────────────┘  │ Report.csv       │                   │
-│                        │ (Managed ID Only)│                   │
-│                        └──────────────────┘                   │
-│                                                                │
-│  ┌──────────────────┐  ┌──────────────────┐                   │
-│  │ DCE/DCR          │─▶│ Error Workspace  │                   │
-│  │ Error Logging    │  │ WorkflowFailures │                   │
-│  └──────────────────┘  │ _CL              │                   │
-│                        └──────────────────┘                   │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Resource Group                                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────┐                                                  │
+│  │  User-Assigned   │◀─── Used by Logic App & API Connections          │
+│  │ Managed Identity │                                                  │
+│  └────────┬─────────┘                                                  │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌────────────────────────────────────────────────────────────────┐    │
+│  │ Logic App (Standard)                                           │    │
+│  │                                                                │    │
+│  │  ┌─ CreateChargeBackReport ─────────────────────────────────┐  │    │
+│  │  │ Recurrence Trigger (every 24h)                           │  │    │
+│  │  │        │                                                 │  │    │
+│  │  │        ▼                                                 │  │    │
+│  │  │ Initialize_Time_Chunks (12 x 2-hour chunks w/ blobName)  │  │    │
+│  │  │        │                                                 │  │    │
+│  │  │        ▼                                                 │  │    │
+│  │  │ ┌─ Process_Time_Chunks (ForEach, sequential) ─────────┐  │  │    │
+│  │  │ │                                                     │  │  │    │
+│  │  │ │  Submit_Chunk_Query (HTTP POST, Prefer: wait=0)     │  │  │    │
+│  │  │ │         │                                           │  │  │    │
+│  │  │ │     ┌───┴───┐                                       │  │  │    │
+│  │  │ │   200?    202?                                      │  │  │    │
+│  │  │ │     │       │                                       │  │  │    │
+│  │  │ │   Sync   Poll_Chunk_Results (Until loop)            │  │  │    │
+│  │  │ │   Path   (15s intervals, max 60 iterations)         │  │  │    │
+│  │  │ │     │       │                                       │  │  │    │
+│  │  │ │     └───┬───┘                                       │  │  │    │
+│  │  │ │         ▼                                           │  │  │    │
+│  │  │ │  Get_Chunk_Results                                  │  │  │    │
+│  │  │ │         │                                           │  │  │    │
+│  │  │ │         ▼                                           │  │  │    │
+│  │  │ │  Transform_Chunk_To_Objects (Select)                │  │  │    │
+│  │  │ │         │                                           │  │  │    │
+│  │  │ │         ▼                                           │  │  │    │
+│  │  │ │  Create_Chunk_CSV (Table)                           │  │  │    │
+│  │  │ │         │                                           │  │  │    │
+│  │  │ │         ▼                                           │  │  │    │
+│  │  │ │  Delete_Existing_Blob → Write_Chunk_Blob            │  │  │    │
+│  │  │ │         │               (one per chunk)             │  │  │    │
+│  │  │ │         ▼                                           │  │  │    │
+│  │  │ │  ───────────────────────────────────────────        │  │  │    │
+│  │  │ │  Output: chargeBack-chunk-{NN}-{start}h-{end}h.csv  │  │  │    │
+│  │  │ └─────────────────────────────────────────────────────┘  │  │    │
+│  │  └──────────────────────────────────────────────────────────┘  │    │
+│  └────────────────────────────────────────────────────────────────┘    │
+│           │                                                            │
+│           ▼                                                            │
+│  ┌──────────────────┐  ┌────────────────────────────────────┐         │
+│  │ Storage (lacb*)  │  │ Storage (rptcb*)                   │         │
+│  │ Internal/Runtime │  │ reportoutput/                      │         │
+│  │ (Key Auth)       │  │   chargeBack-chunk-01-21h-23h.csv  │         │
+│  └──────────────────┘  │   chargeBack-chunk-02-23h-01h.csv  │         │
+│                        │   ...                               │         │
+│                        │   chargeBack-chunk-12-19h-21h.csv  │         │
+│                        │ (Managed ID Only, 12 files/run)    │         │
+│                        └────────────────────────────────────┘         │
+│                                                                        │
+│  ┌──────────────────┐  ┌──────────────────┐                           │
+│  │ DCE/DCR          │─▶│ Error Workspace  │                           │
+│  │ Error Logging    │  │ WorkflowFailures │                           │
+│  └──────────────────┘  │ _CL              │                           │
+│                        └──────────────────┘                           │
+└─────────────────────────────────────────────────────────────────────────┘
             │
             ▼
-┌──────────────────────────────┐
-│ Source Log Analytics         │
-│ (External Resource Group)    │
-│ ApiManagementGatewayLogs     │
-│ ApiManagementGatewayLlmLog   │
-└──────────────────────────────┘
+┌──────────────────────────────────┐
+│ Source Log Analytics             │
+│ (External Resource Group)        │
+│ ApiManagementGatewayLogs         │
+│ ApiManagementGatewayLlmLog       │
+│ CognitiveServicesInventory_CL    │
+└──────────────────────────────────┘
 ```
 
 ## KQL Query
 
-The workflow executes this query against the source Log Analytics workspace:
+The workflow executes this optimized query against the source Log Analytics workspace for each 2-hour time chunk:
 
 ```kql
+// Pre-aggregate LLM log data before joining (reduces memory usage)
+let llmAgg = ApiManagementGatewayLlmLog 
+| where TimeGenerated >= ago({hoursAgo}h) and TimeGenerated < ago({hoursUntil}h)
+| where SequenceNumber == 0 
+| summarize 
+    TotalTokens = sum(TotalTokens), 
+    CompletionTokens = sum(CompletionTokens), 
+    PromptTokens = sum(PromptTokens) 
+    by CorrelationId;
+
+// Main query with shuffle hint for distributed join processing
 ApiManagementGatewayLogs 
-| where TimeGenerated >= ago(24h) 
-| join kind=inner ApiManagementGatewayLlmLog on CorrelationId 
-| where SequenceNumber == 0 and IsRequestSuccess 
+| where TimeGenerated >= ago({hoursAgo}h) and TimeGenerated < ago({hoursUntil}h)
+| where IsRequestSuccess 
+| join hint.strategy=shuffle kind=inner llmAgg on CorrelationId 
+| extend ParsedUrl = parse_url(BackendUrl) 
+| extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') 
+| extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) 
+| extend 
+    Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), 
+    Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) 
+| join kind=leftouter (
+    CognitiveServicesInventory_CL 
+    | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName 
+    | project 
+        AccountEndpoint, 
+        CogSvcDeploymentName = DeploymentName,
+        CogSvcModelName = ModelName,
+        CogSvcSkuName = SkuName,
+        CogSvcSkuCapacity = SkuCapacity,
+        CogSvcAccountName = AccountName,
+        CogSvcSubscriptionId = SubscriptionId
+) on $left.ExtractedEndpoint == $right.AccountEndpoint, 
+   $left.DeploymentFromUrl == $right.CogSvcDeploymentName 
 | summarize 
     TotalTokens = sum(TotalTokens), 
     CompletionTokens = sum(CompletionTokens), 
     PromptTokens = sum(PromptTokens), 
     FirstSeen = min(TimeGenerated), 
     LastSeen = max(TimeGenerated), 
-    Regions = make_set(Region, 8), 
-    CallerIpAddresses = make_set(CallerIpAddress, 8), 
-    Caches = make_set(Cache, 8), 
-    BackendIds = make_set(BackendId, 8), 
+    Regions = strcat_array(make_set(Region, 8), '; '), 
+    CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), 
     Calls = count() 
-    by ProductId, ModelName 
-| project ProductId, ModelName, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses, Caches, BackendIds 
-| order by TotalTokens desc
+    by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, 
+       CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, 
+       CogSvcSubscriptionId, Luma, Workspace 
+| project 
+    ProductId, Luma, Workspace, 
+    DeploymentName = DeploymentFromUrl, 
+    ModelName = CogSvcModelName, 
+    AccountName = CogSvcAccountName, 
+    SubscriptionId = CogSvcSubscriptionId, 
+    SkuName = CogSvcSkuName, 
+    SkuCapacity = CogSvcSkuCapacity, 
+    BackendId, 
+    Endpoint = ExtractedEndpoint, 
+    PromptTokens, CompletionTokens, TotalTokens, Calls, 
+    FirstSeen, LastSeen, Regions, CallerIpAddresses 
+| order by ProductId asc, TotalTokens desc
 ```
 
-The `Transform_Query_Results_To_Rows` action maps the columnar result to named fields using positional indexes that match the `project` clause order:
+### Query Optimizations
 
-| Index | Column |
-|-------|--------|
-| 0 | ProductId |
-| 1 | ModelName |
-| 2 | PromptTokens |
-| 3 | CompletionTokens |
-| 4 | TotalTokens |
-| 5 | Calls |
-| 6 | FirstSeen |
-| 7 | LastSeen |
-| 8 | Regions |
-| 9 | CallerIpAddresses |
-| 10 | Caches |
-| 11 | BackendIds |
+1. **Pre-aggregation** (`let llmAgg = ...`) — Aggregates token counts by CorrelationId BEFORE the join, reducing the dataset size at join time
+2. **Shuffle hint** (`hint.strategy=shuffle`) — Distributes join processing across cluster nodes for better parallelism
+3. **CognitiveServicesInventory_CL join** — Enriches data with Azure OpenAI deployment metadata (model name, SKU, capacity)
+4. **Luma/Workspace extraction** — Parses subscription ID patterns for organizational attribution
+5. **strcat_array for set fields** — Converts `make_set()` arrays to semicolon-delimited strings for CSV compatibility
 
-> **Important:** If you modify the `project` clause in the KQL query, you must also update the positional indexes in `Transform_Query_Results_To_Rows` in `workflow.json` to match.
+The `Transform_Chunk_To_Objects` action maps the columnar result to named fields using positional indexes that match the `project` clause order:
+
+| Index | Column | Description |
+|-------|--------|-------------|
+| 0 | ProductId | APIM Product ID |
+| 1 | Luma | 6-digit org code extracted from subscription ID |
+| 2 | Workspace | Workspace name extracted from subscription ID |
+| 3 | DeploymentName | Azure OpenAI deployment name from URL |
+| 4 | ModelName | Model name from CognitiveServicesInventory_CL |
+| 5 | AccountName | Azure OpenAI account name |
+| 6 | SubscriptionId | Azure subscription containing the OpenAI resource |
+| 7 | SkuName | SKU name (Standard, etc.) |
+| 8 | SkuCapacity | Provisioned capacity (PTU/TPM) |
+| 9 | BackendId | APIM backend identifier |
+| 10 | Endpoint | Azure OpenAI endpoint URL |
+| 11 | PromptTokens | Total prompt tokens consumed |
+| 12 | CompletionTokens | Total completion tokens generated |
+| 13 | TotalTokens | Sum of prompt + completion tokens |
+| 14 | Calls | Number of API calls |
+| 15 | FirstSeen | Earliest request timestamp |
+| 16 | LastSeen | Latest request timestamp |
+| 17 | Regions | Semicolon-delimited list of Azure regions (max 8) |
+| 18 | CallerIpAddresses | Semicolon-delimited list of caller IPs (max 8) |
+
+> **Important:** If you modify the `project` clause in the KQL query, you must also update the positional indexes in `Transform_Chunk_To_Objects` in `workflow.json` to match.
 
 ## Post-Deployment
 
 ### Monitor
 
-- **Report Output**: Check blob storage container `reportoutput` for `dailyChargeBackReport.csv`
+- **Report Output**: Check blob storage container `reportoutput` for 12 chunk files (`chargeBack-chunk-*.csv`)
 - **Workflow Runs**: View run history in Logic App portal → Workflows → CreateChargeBackReport
 - **Error Logs**: Query `WorkflowFailures_CL` table in error workspace:
 
@@ -348,8 +437,19 @@ If connections show as "Invalid" or "Forbidden":
 
 - Verify the source workspace name and resource group are correct in `deploy-infrastructure.bicepparam`
 - Confirm the managed identity has both **Log Analytics Reader** and **Reader** roles on the source workspace
-- Ensure `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables exist in the workspace
+- Ensure `ApiManagementGatewayLogs`, `ApiManagementGatewayLlmLog`, and `CognitiveServicesInventory_CL` tables exist in the workspace
 - Restart the Logic App after RBAC changes
+
+### Query Failures (Memory Limit Error -2133196799)
+
+If you see error code `-2133196799` with message about exceeding memory limits:
+
+1. **Reduce chunk size**: Change from 2-hour to 1-hour chunks in `Initialize_Time_Chunks` (will result in 24 chunks)
+2. **Add row limits**: Add `| take 10000` to the KQL query to limit results per chunk
+3. **Verify pre-aggregation**: Ensure the `let llmAgg = ...` pattern is being used to aggregate before joining
+4. **Check shuffle hint**: Ensure `hint.strategy=shuffle` is present on the join
+
+The 5GB memory limit applies to intermediate results during query execution. Pre-aggregating the LLM log data before joining significantly reduces memory usage.
 
 ### Blob Write Failures
 
@@ -378,7 +478,79 @@ If the portal shows "Service Unavailable" but the workflow runs successfully via
 
 ### Modify Query
 
-Edit the `query` field in the `Submit_Async_Query` action in [CreateChargeBackReport/workflow.json](CreateChargeBackReport/workflow.json). If you change the `project` columns, you must also update the positional indexes in `Transform_Query_Results_To_Rows` to match (see column index table above).
+Edit the `query` field in the `Submit_Chunk_Query` action in [CreateChargeBackReport/workflow.json](CreateChargeBackReport/workflow.json). If you change the `project` columns, you must also update the positional indexes in `Transform_Chunk_To_Objects` to match (see column index table above).
+
+### Change Time Chunk Size
+
+To use smaller or larger time chunks, edit the `Initialize_Time_Chunks` action. For example, to use 1-hour chunks (24 total):
+```json
+"value": [
+  { "chunkId": 1, "hoursAgo": 24, "hoursUntil": 23, "blobName": "chargeBack-chunk-01.csv" },
+  { "chunkId": 2, "hoursAgo": 23, "hoursUntil": 22, "blobName": "chargeBack-chunk-02.csv" },
+  ...
+]
+```
+
+Smaller chunks reduce memory usage per query but increase total execution time and the number of output blobs.
+
+### Enable Parallel Chunk Processing
+
+By default, chunks are processed **sequentially** (one at a time) to avoid overloading log Analytics. This is controlled by the `runtimeConfiguration` on the `Process_Time_Chunks` ForEach loop:
+
+```json
+"runtimeConfiguration": {
+  "concurrency": {
+    "repetitions": 1
+  }
+}
+```
+
+To enable parallel processing, increase the `repetitions` value in [CreateChargeBackReport/workflow.json](CreateChargeBackReport/workflow.json):
+
+| Setting | Behavior | Run Time (approx) |
+|---------|----------|-------------------|
+| `repetitions: 1` | Sequential (default) | 6-12 minutes |
+| `repetitions: 4` | 4 concurrent chunks | 2-3 minutes |
+| `repetitions: 6` | 6 concurrent chunks | 1-2 minutes |
+| `repetitions: 12` | All 12 concurrent | <1 minute (risky) |
+
+**Considerations before enabling parallelization:**
+
+1. **Log Analytics Concurrent Query Limit** — Each workspace supports ~10 concurrent queries. Running all 12 chunks in parallel may cause throttling (HTTP 429) or query failures.
+
+2. **Managed Identity Token Acquisition** — High concurrency can cause token acquisition contention. The workflow uses `Prefer: wait=0` (async) which helps, but rapid parallel requests may still encounter brief delays.
+
+3. **Retry Behavior** — If a chunk fails due to throttling, it will not automatically retry in the current workflow. Consider adding retry policies if enabling high parallelism.
+
+4. **Blob Write Conflicts** — Each chunk writes to a unique blob, so there are no write conflicts. However, if the workflow fails mid-run with parallelism enabled, you may have partial results (some blobs updated, others stale).
+
+5. **Cost** — Logic App Standard is billed per action execution. Parallelism doesn't change the number of actions, but faster runs may allow more frequent scheduling if needed.
+
+**Recommended approach:** Start with `repetitions: 4` for a ~3x speedup with minimal risk, then increase if stable.
+
+### Configure Report Time Window
+
+By default, the report covers 9pm the previous evening to 9pm the evening before that (24 hours ending at 9pm yesterday). This is controlled by the `REPORT_END_HOUR` app setting.
+
+**Change the report end hour:**
+```powershell
+# Set report to end at midnight (covers midnight-to-midnight)
+az webapp config appsettings set --name logic-chargeback-xxx --resource-group rg-xxx \
+  --settings REPORT_END_HOUR=0
+
+# Set report to end at 5pm (covers 5pm-to-5pm)
+az webapp config appsettings set --name logic-chargeback-xxx --resource-group rg-xxx \
+  --settings REPORT_END_HOUR=17
+```
+
+| REPORT_END_HOUR | Report Window (when run today) |
+|-----------------|-------------------------------|
+| 0 (midnight) | Midnight yesterday to midnight day before |
+| 9 (9am) | 9am yesterday to 9am day before |
+| 17 (5pm) | 5pm yesterday to 5pm day before |
+| 21 (9pm, default) | 9pm yesterday to 9pm day before |
+
+**Note:** The report always covers the 24 hours ending at the specified hour **yesterday**. This ensures complete data even if the workflow runs late.
 
 ### Change Schedule
 
@@ -391,16 +563,19 @@ Edit `Recurrence` trigger:
 }
 ```
 
-### Modify Report Name/Path
+### Modify Blob Naming
 
-Edit `Create_blob_(V2)` action `queries`:
+Each chunk's blob name is defined in the `Initialize_Time_Chunks` array. To change the naming pattern, edit the `blobName` property for each chunk:
 ```json
-"queries": {
-  "folderPath": "reportoutput",
-  "name": "dailyChargeBackReport.csv",
-  "queryParametersSingleEncoded": true
+{
+  "chunkId": 1,
+  "hoursAgo": 24,
+  "hoursUntil": 22,
+  "blobName": "chargeBack-chunk-01-21h-23h.csv"
 }
 ```
+
+The naming convention uses the time window (relative to the report end hour) in the filename to make it easy to identify each chunk's coverage period.
 
 ## Files
 
@@ -431,11 +606,17 @@ PTUChargeBackWorkflow/
 
 3. **Async Query Pattern**: The workflow uses the Log Analytics REST API with `Prefer: wait=0` rather than the managed API connector, enabling asynchronous query execution to avoid HTTP timeouts on large datasets.
 
-4. **Positional Column Mapping**: `Transform_Query_Results_To_Rows` uses `@item()[N]` positional indexes rather than column-name lookups, because Logic App Standard expression language does not support `where()`/`first()`/`indexOf()` functions on arrays.
+4. **Time Chunking with Separate Blobs**: To avoid the 5GB memory limit on Log Analytics joins, the workflow splits queries into 12 x 2-hour chunks. Each chunk's results are written to a separate blob file. Downstream consumers aggregate the 12 files as needed. This approach avoids complex in-Logic-App aggregation and ensures .NET runtime compatibility.
 
-5. **Storage Cache**: Logic App Standard stores workflow definitions in an Azure Files share. When redeploying, if old definitions persist, delete both the Logic App and its backing storage account before redeploying.
+5. **Pre-Aggregation in KQL**: The KQL query pre-aggregates the `ApiManagementGatewayLlmLog` table before joining, and uses `strcat_array(make_set(...), '; ')` to produce string fields for Regions and CallerIpAddresses, ensuring CSV compatibility.
 
-6. **Resource Naming**: All resource names include a deterministic suffix generated by `uniqueString(resourceGroup().id)` to ensure uniqueness across Azure.
+6. **Positional Column Mapping**: `Transform_Chunk_To_Objects` uses `@item()[N]` positional indexes rather than column-name lookups, because Logic App Standard expression language does not support `where()`/`first()`/`indexOf()` functions on arrays.
+
+7. **Storage Cache**: Logic App Standard stores workflow definitions in an Azure Files share. When redeploying, if old definitions persist, delete both the Logic App and its backing storage account before redeploying.
+
+8. **Resource Naming**: All resource names include a deterministic suffix generated by `uniqueString(resourceGroup().id)` to ensure uniqueness across Azure.
+
+9. **Pure Logic App Solution**: This workflow runs entirely within Logic App Standard with no external dependencies on Azure Functions or JavaScript code actions, ensuring full compatibility with .NET-based runtimes.
 
 ## License
 
