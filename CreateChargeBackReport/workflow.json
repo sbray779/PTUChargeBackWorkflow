@@ -1,4 +1,4 @@
-﻿{
+{
   "definition": {
     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
     "contentVersion": "1.0.0.0",
@@ -61,7 +61,7 @@
               },
               "authentication": {
                 "type": "ManagedServiceIdentity",
-                "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                 "audience": "https://api.loganalytics.io"
               }
             },
@@ -127,7 +127,7 @@
                         "method": "GET",
                         "authentication": {
                           "type": "ManagedServiceIdentity",
-                          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                           "audience": "https://api.loganalytics.io"
                         }
                       },
@@ -194,18 +194,19 @@
                 "ModelName": "@item()[4]",
                 "AccountName": "@item()[5]",
                 "SubscriptionId": "@item()[6]",
-                "SkuName": "@item()[7]",
-                "SkuCapacity": "@item()[8]",
-                "BackendId": "@item()[9]",
-                "Endpoint": "@item()[10]",
-                "PromptTokens": "@item()[11]",
-                "CompletionTokens": "@item()[12]",
-                "TotalTokens": "@item()[13]",
-                "Calls": "@item()[14]",
-                "FirstSeen": "@item()[15]",
-                "LastSeen": "@item()[16]",
-                "Regions": "@item()[17]",
-                "CallerIpAddresses": "@item()[18]"
+                "ResourceID": "@item()[7]",
+                "SkuName": "@item()[8]",
+                "SkuCapacity": "@item()[9]",
+                "BackendId": "@item()[10]",
+                "Endpoint": "@item()[11]",
+                "PromptTokens": "@item()[12]",
+                "CompletionTokens": "@item()[13]",
+                "TotalTokens": "@item()[14]",
+                "Calls": "@item()[15]",
+                "FirstSeen": "@item()[16]",
+                "LastSeen": "@item()[17]",
+                "Regions": "@item()[18]",
+                "CallerIpAddresses": "@item()[19]"
               }
             },
             "runAfter": {
@@ -293,7 +294,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -313,7 +314,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -326,7 +327,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -346,7 +347,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -361,3 +362,5 @@
   },
   "kind": "Stateful"
 }
+
+

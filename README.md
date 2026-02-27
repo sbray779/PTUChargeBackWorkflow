@@ -309,64 +309,73 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 The workflow executes this optimized query against the source Log Analytics workspace for each 2-hour time chunk:
 
 ```kql
+// Compute time window: covers 24h ending at REPORT_END_HOUR yesterday
+let reportEnd = datetime_add('hour', int(REPORT_END_HOUR), startofday(now() - 1d));
+let chunkStart = datetime_add('hour', -hoursAgo, reportEnd);
+let chunkEnd   = datetime_add('hour', -hoursUntil, reportEnd);
+
 // Pre-aggregate LLM log data before joining (reduces memory usage)
-let llmAgg = ApiManagementGatewayLlmLog 
-| where TimeGenerated >= ago({hoursAgo}h) and TimeGenerated < ago({hoursUntil}h)
-| where SequenceNumber == 0 
-| summarize 
-    TotalTokens = sum(TotalTokens), 
-    CompletionTokens = sum(CompletionTokens), 
-    PromptTokens = sum(PromptTokens) 
+let llmAgg = ApiManagementGatewayLlmLog
+| where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd
+| where SequenceNumber == 0
+| summarize
+    TotalTokens       = sum(TotalTokens),
+    CompletionTokens  = sum(CompletionTokens),
+    PromptTokens      = sum(PromptTokens)
     by CorrelationId;
 
 // Main query with shuffle hint for distributed join processing
-ApiManagementGatewayLogs 
-| where TimeGenerated >= ago({hoursAgo}h) and TimeGenerated < ago({hoursUntil}h)
-| where IsRequestSuccess 
-| join hint.strategy=shuffle kind=inner llmAgg on CorrelationId 
-| extend ParsedUrl = parse_url(BackendUrl) 
-| extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') 
-| extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) 
-| extend 
-    Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), 
-    Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) 
+ApiManagementGatewayLogs
+| where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd
+| where IsRequestSuccess
+| join hint.strategy=shuffle kind=inner llmAgg on CorrelationId
+| extend ParsedUrl = parse_url(BackendUrl)
+| extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/')
+| extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl)
+| extend
+    Luma      = extract('^([0-9]{6})', 1, ApimSubscriptionId),
+    Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId)
 | join kind=leftouter (
-    CognitiveServicesInventory_CL 
-    | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName 
-    | project 
-        AccountEndpoint, 
-        CogSvcDeploymentName = DeploymentName,
-        CogSvcModelName = ModelName,
-        CogSvcSkuName = SkuName,
-        CogSvcSkuCapacity = SkuCapacity,
-        CogSvcAccountName = AccountName,
-        CogSvcSubscriptionId = SubscriptionId
-) on $left.ExtractedEndpoint == $right.AccountEndpoint, 
-   $left.DeploymentFromUrl == $right.CogSvcDeploymentName 
-| summarize 
-    TotalTokens = sum(TotalTokens), 
-    CompletionTokens = sum(CompletionTokens), 
-    PromptTokens = sum(PromptTokens), 
-    FirstSeen = min(TimeGenerated), 
-    LastSeen = max(TimeGenerated), 
-    Regions = strcat_array(make_set(Region, 8), '; '), 
-    CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), 
-    Calls = count() 
-    by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, 
-       CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, 
-       CogSvcSubscriptionId, Luma, Workspace 
-| project 
-    ProductId, Luma, Workspace, 
-    DeploymentName = DeploymentFromUrl, 
-    ModelName = CogSvcModelName, 
-    AccountName = CogSvcAccountName, 
-    SubscriptionId = CogSvcSubscriptionId, 
-    SkuName = CogSvcSkuName, 
-    SkuCapacity = CogSvcSkuCapacity, 
-    BackendId, 
-    Endpoint = ExtractedEndpoint, 
-    PromptTokens, CompletionTokens, TotalTokens, Calls, 
-    FirstSeen, LastSeen, Regions, CallerIpAddresses 
+    CognitiveServicesInventory_CL
+    | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName
+    | project
+        AccountEndpoint,
+        CogSvcDeploymentName  = DeploymentName,
+        CogSvcModelName       = ModelName,
+        CogSvcSkuName         = SkuName,
+        CogSvcSkuCapacity     = SkuCapacity,
+        CogSvcAccountName     = AccountName,
+        CogSvcSubscriptionId  = SubscriptionId,
+        CogSvcAccountId       = AccountId
+) on $left.ExtractedEndpoint == $right.AccountEndpoint,
+   $left.DeploymentFromUrl   == $right.CogSvcDeploymentName
+| summarize
+    TotalTokens      = sum(TotalTokens),
+    CompletionTokens = sum(CompletionTokens),
+    PromptTokens     = sum(PromptTokens),
+    FirstSeen        = min(TimeGenerated),
+    LastSeen         = max(TimeGenerated),
+    Regions          = strcat_array(make_set(Region, 8), '; '),
+    CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '),
+    Calls = count()
+    by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId,
+       CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName,
+       CogSvcSubscriptionId, CogSvcAccountId, Luma, Workspace
+| project
+    ProductId,
+    Luma,
+    Workspace,
+    DeploymentName = DeploymentFromUrl,
+    ModelName      = CogSvcModelName,
+    AccountName    = CogSvcAccountName,
+    SubscriptionId = CogSvcSubscriptionId,
+    ResourceID     = CogSvcAccountId,
+    SkuName        = CogSvcSkuName,
+    SkuCapacity    = CogSvcSkuCapacity,
+    BackendId,
+    Endpoint       = ExtractedEndpoint,
+    PromptTokens, CompletionTokens, TotalTokens, Calls,
+    FirstSeen, LastSeen, Regions, CallerIpAddresses
 | order by ProductId asc, TotalTokens desc
 ```
 
@@ -389,18 +398,19 @@ The `Transform_Chunk_To_Objects` action maps the columnar result to named fields
 | 4 | ModelName | Model name from CognitiveServicesInventory_CL |
 | 5 | AccountName | Azure OpenAI account name |
 | 6 | SubscriptionId | Azure subscription containing the OpenAI resource |
-| 7 | SkuName | SKU name (Standard, etc.) |
-| 8 | SkuCapacity | Provisioned capacity (PTU/TPM) |
-| 9 | BackendId | APIM backend identifier |
-| 10 | Endpoint | Azure OpenAI endpoint URL |
-| 11 | PromptTokens | Total prompt tokens consumed |
-| 12 | CompletionTokens | Total completion tokens generated |
-| 13 | TotalTokens | Sum of prompt + completion tokens |
-| 14 | Calls | Number of API calls |
-| 15 | FirstSeen | Earliest request timestamp |
-| 16 | LastSeen | Latest request timestamp |
-| 17 | Regions | Semicolon-delimited list of Azure regions (max 8) |
-| 18 | CallerIpAddresses | Semicolon-delimited list of caller IPs (max 8) |
+| 7 | ResourceID | Azure resource ID of the Cognitive Services account |
+| 8 | SkuName | SKU name (e.g., ProvisionedManaged) |
+| 9 | SkuCapacity | Provisioned capacity (PTU/TPM) |
+| 10 | BackendId | APIM backend identifier |
+| 11 | Endpoint | Azure OpenAI endpoint URL |
+| 12 | PromptTokens | Total prompt tokens consumed |
+| 13 | CompletionTokens | Total completion tokens generated |
+| 14 | TotalTokens | Sum of prompt + completion tokens |
+| 15 | Calls | Number of API calls |
+| 16 | FirstSeen | Earliest request timestamp |
+| 17 | LastSeen | Latest request timestamp |
+| 18 | Regions | Semicolon-delimited list of Azure regions (max 8) |
+| 19 | CallerIpAddresses | Semicolon-delimited list of caller IPs (max 8) |
 
 > **Important:** If you modify the `project` clause in the KQL query, you must also update the positional indexes in `Transform_Chunk_To_Objects` in `workflow.json` to match.
 
