@@ -1,4 +1,4 @@
-﻿{
+{
   "definition": {
     "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
     "contentVersion": "1.0.0.0",
@@ -57,11 +57,11 @@
                 "Prefer": "wait=0"
               },
               "body": {
-                "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now() - 1d)); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
+                "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now() - 1d)); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId, CogSvcAccountId = AccountId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, CogSvcAccountId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, ResourceID = CogSvcAccountId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
               },
               "authentication": {
                 "type": "ManagedServiceIdentity",
-                "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                 "audience": "https://api.loganalytics.io"
               }
             },
@@ -127,7 +127,7 @@
                         "method": "GET",
                         "authentication": {
                           "type": "ManagedServiceIdentity",
-                          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                           "audience": "https://api.loganalytics.io"
                         }
                       },
@@ -194,18 +194,19 @@
                 "ModelName": "@item()[4]",
                 "AccountName": "@item()[5]",
                 "SubscriptionId": "@item()[6]",
-                "SkuName": "@item()[7]",
-                "SkuCapacity": "@item()[8]",
-                "BackendId": "@item()[9]",
-                "Endpoint": "@item()[10]",
-                "PromptTokens": "@item()[11]",
-                "CompletionTokens": "@item()[12]",
-                "TotalTokens": "@item()[13]",
-                "Calls": "@item()[14]",
-                "FirstSeen": "@item()[15]",
-                "LastSeen": "@item()[16]",
-                "Regions": "@item()[17]",
-                "CallerIpAddresses": "@item()[18]"
+                "ResourceID": "@item()[7]",
+                "SkuName": "@item()[8]",
+                "SkuCapacity": "@item()[9]",
+                "BackendId": "@item()[10]",
+                "Endpoint": "@item()[11]",
+                "PromptTokens": "@item()[12]",
+                "CompletionTokens": "@item()[13]",
+                "TotalTokens": "@item()[14]",
+                "Calls": "@item()[15]",
+                "FirstSeen": "@item()[16]",
+                "LastSeen": "@item()[17]",
+                "Regions": "@item()[18]",
+                "CallerIpAddresses": "@item()[19]"
               }
             },
             "runAfter": {
@@ -293,7 +294,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -313,7 +314,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -326,7 +327,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-cbbr.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-7f17b77d08b54df991666d73380136e0/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -346,7 +347,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -361,3 +362,5 @@
   },
   "kind": "Stateful"
 }
+
+

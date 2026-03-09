@@ -15,7 +15,7 @@ workflow-designtime/
 *.code-workspace
 
 # Deployment parameters (contains environment-specific values)
-deploy-infrastructure.bicepparam
+*.bicepparam
 
 # Deployment artifacts
 deploy.zip
