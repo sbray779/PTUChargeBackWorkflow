@@ -420,9 +420,25 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Using Azure Functions Core Tools version: $funcVersion" -ForegroundColor Gray
 
+# Generate local.settings.json required by func CLI to identify the project runtime.
+# Logic App Standard on dotnet runtime requires this to be present for func publish.
+$localSettingsPath = Join-Path $PSScriptRoot "local.settings.json"
+$localSettings = @{
+    IsEncrypted = $false
+    Values      = @{
+        FUNCTIONS_WORKER_RUNTIME = "dotnet"
+        AzureWebJobsStorage      = ""
+    }
+}
+$localSettings | ConvertTo-Json -Depth 5 | Set-Content $localSettingsPath -Encoding UTF8
+Write-Host "  Generated local.settings.json for func CLI" -ForegroundColor Gray
+
 # Deploy workflow - capture output to show errors
 Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
 $publishOutput = func azure functionapp publish $LogicAppName 2>&1
+
+# Clean up the generated local.settings.json regardless of outcome
+Remove-Item $localSettingsPath -ErrorAction SilentlyContinue
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
