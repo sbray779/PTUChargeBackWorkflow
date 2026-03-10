@@ -111,11 +111,11 @@
                 "Prefer": "wait=0"
               },
               "body": {
-                "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now())); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId, CogSvcAccountId = AccountId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, CogSvcAccountId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, ResourceID = CogSvcAccountId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
+                "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now() - 1d)); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId, CogSvcAccountId = AccountId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, CogSvcAccountId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, ResourceID = CogSvcAccountId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
               },
               "authentication": {
                 "type": "ManagedServiceIdentity",
-                "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                 "audience": "https://api.loganalytics.io"
               }
             },
@@ -181,7 +181,7 @@
                         "method": "GET",
                         "authentication": {
                           "type": "ManagedServiceIdentity",
-                          "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                          "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                           "audience": "https://api.loganalytics.io"
                         }
                       },
@@ -325,7 +325,7 @@
                 "type": "Http",
                 "description": "POST this chunk's enriched rows to ChargeBackChunks_CL via the Logs Ingestion API. Tagged with WorkflowRunId to enable idempotent daily re-aggregation.",
                 "inputs": {
-                  "uri": "https://dce-chargeback-tvn4e57jpmg4q-5h4y.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-829cd683f0bf4bb8b98044ed97e7b578/streams/Custom-ChargeBackChunksStream?api-version=2023-01-01",
+                  "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-ChargeBackChunksStream?api-version=2023-01-01",
                   "method": "POST",
                   "headers": {
                     "Content-Type": "application/json"
@@ -333,7 +333,7 @@
                   "body": "@body('Enrich_Chunk_Rows')",
                   "authentication": {
                     "type": "ManagedServiceIdentity",
-                    "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                    "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                     "audience": "https://monitor.azure.com"
                   }
                 },
@@ -413,7 +413,7 @@
               },
               "authentication": {
                 "type": "ManagedServiceIdentity",
-                "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                 "audience": "https://api.loganalytics.io"
               }
             },
@@ -457,7 +457,7 @@
           },
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://api.loganalytics.io"
           }
         },
@@ -528,7 +528,7 @@
                     "method": "GET",
                     "authentication": {
                       "type": "ManagedServiceIdentity",
-                      "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+                      "identity": "{{USER_MANAGED_IDENTITY_ID}}",
                       "audience": "https://api.loganalytics.io"
                     }
                   },
@@ -664,7 +664,7 @@
       "Handle_Query_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-5h4y.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-829cd683f0bf4bb8b98044ed97e7b578/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -684,7 +684,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
@@ -697,7 +697,7 @@
       "Handle_Blob_Write_Failure": {
         "type": "Http",
         "inputs": {
-          "uri": "https://dce-chargeback-tvn4e57jpmg4q-5h4y.eastus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-829cd683f0bf4bb8b98044ed97e7b578/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
+          "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-WorkflowFailuresStream?api-version=2023-01-01",
           "method": "POST",
           "headers": {
             "Content-Type": "application/json"
@@ -717,7 +717,7 @@
           ],
           "authentication": {
             "type": "ManagedServiceIdentity",
-            "identity": "/subscriptions/b5b4a11b-5367-41d2-9ec2-fee75c17c5f9/resourceGroups/PTUChargeBackChunks/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-chargeback-tvn4e57jpmg4q",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
             "audience": "https://monitor.azure.com"
           }
         },
