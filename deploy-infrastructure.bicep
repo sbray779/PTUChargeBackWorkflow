@@ -125,11 +125,7 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
         }
         {
           name: 'FUNCTIONS_WORKER_RUNTIME'
-          value: 'node'
-        }
-        {
-          name: 'WEBSITE_NODE_DEFAULT_VERSION'
-          value: '~18'
+          value: 'dotnet'
         }
         {
           name: 'AzureFunctionsJobHost__extensionBundle__id'
@@ -175,6 +171,10 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'REPORT_END_HOUR'
           value: '21'
         }
+        {
+          name: 'ERROR_WORKSPACE_ID'
+          value: errorWorkspace.properties.customerId
+        }
       ]
       netFrameworkVersion: 'v6.0'
       use32BitWorkerProcess: false
@@ -219,6 +219,43 @@ resource customTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01
   }
 }
 
+// Intermediate chunk-level summary table used for idempotent daily re-aggregation (Option C pattern)
+resource chargeBackChunksTable 'Microsoft.OperationalInsights/workspaces/tables@2022-10-01' = {
+  name: 'ChargeBackChunks_CL'
+  parent: errorWorkspace
+  properties: {
+    schema: {
+      name: 'ChargeBackChunks_CL'
+      columns: [
+        { name: 'TimeGenerated', type: 'datetime' }
+        { name: 'ReportDate', type: 'string' }
+        { name: 'WorkflowRunId', type: 'string' }
+        { name: 'ChunkId', type: 'real' }
+        { name: 'ProductId', type: 'string' }
+        { name: 'Luma', type: 'string' }
+        { name: 'Workspace', type: 'string' }
+        { name: 'DeploymentName', type: 'string' }
+        { name: 'ModelName', type: 'string' }
+        { name: 'AccountName', type: 'string' }
+        { name: 'SubscriptionId', type: 'string' }
+        { name: 'ResourceID', type: 'string' }
+        { name: 'SkuName', type: 'string' }
+        { name: 'SkuCapacity', type: 'real' }
+        { name: 'BackendId', type: 'string' }
+        { name: 'Endpoint', type: 'string' }
+        { name: 'PromptTokens', type: 'real' }
+        { name: 'CompletionTokens', type: 'real' }
+        { name: 'TotalTokens', type: 'real' }
+        { name: 'Calls', type: 'real' }
+        { name: 'FirstSeen', type: 'datetime' }
+        { name: 'LastSeen', type: 'datetime' }
+        { name: 'Regions', type: 'string' }
+        { name: 'CallerIpAddresses', type: 'string' }
+      ]
+    }
+  }
+}
+
 // Data Collection Endpoint
 resource dce 'Microsoft.Insights/dataCollectionEndpoints@2022-06-01' = {
   name: dceEndpointName
@@ -250,6 +287,34 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
           { name: 'BlobPath', type: 'string' }
         ]
       }
+      'Custom-ChargeBackChunksStream': {
+        columns: [
+          { name: 'TimeGenerated', type: 'datetime' }
+          { name: 'ReportDate', type: 'string' }
+          { name: 'WorkflowRunId', type: 'string' }
+          { name: 'ChunkId', type: 'real' }
+          { name: 'ProductId', type: 'string' }
+          { name: 'Luma', type: 'string' }
+          { name: 'Workspace', type: 'string' }
+          { name: 'DeploymentName', type: 'string' }
+          { name: 'ModelName', type: 'string' }
+          { name: 'AccountName', type: 'string' }
+          { name: 'SubscriptionId', type: 'string' }
+          { name: 'ResourceID', type: 'string' }
+          { name: 'SkuName', type: 'string' }
+          { name: 'SkuCapacity', type: 'real' }
+          { name: 'BackendId', type: 'string' }
+          { name: 'Endpoint', type: 'string' }
+          { name: 'PromptTokens', type: 'real' }
+          { name: 'CompletionTokens', type: 'real' }
+          { name: 'TotalTokens', type: 'real' }
+          { name: 'Calls', type: 'real' }
+          { name: 'FirstSeen', type: 'datetime' }
+          { name: 'LastSeen', type: 'datetime' }
+          { name: 'Regions', type: 'string' }
+          { name: 'CallerIpAddresses', type: 'string' }
+        ]
+      }
     }
     destinations: {
       logAnalytics: [
@@ -266,7 +331,28 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
         transformKql: 'source'
         outputStream: 'Custom-WorkflowFailures_CL'
       }
+      {
+        streams: [ 'Custom-ChargeBackChunksStream' ]
+        destinations: [ 'errorWorkspace' ]
+        transformKql: 'source'
+        outputStream: 'Custom-ChargeBackChunks_CL'
+      }
     ]
+  }
+  dependsOn: [
+    customTable
+    chargeBackChunksTable
+  ]
+}
+
+// RBAC: Log Analytics Reader on error workspace for Logic App (needed to query ChargeBackChunks_CL)
+resource errorWorkspaceReaderRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(errorWorkspace.id, userManagedIdentity.id, '73c42c96-874c-492b-b04d-ab87d138a893')
+  scope: errorWorkspace
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '73c42c96-874c-492b-b04d-ab87d138a893')
+    principalId: userManagedIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 

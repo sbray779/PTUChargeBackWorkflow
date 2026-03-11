@@ -23,36 +23,53 @@ The solution uses **Bicep templates** and **PowerShell** to deploy a complete in
 
 ## Workflow Overview
 
-The `CreateChargeBackReport` workflow uses a **time-chunked query pattern** to avoid Log Analytics memory limits (5GB) on large datasets. Instead of running a single 24-hour query, it splits the time range into **12 x 2-hour chunks** and writes each chunk's results to a separate blob file:
+The `CreateChargeBackReport` workflow uses a **time-chunked query + Log Analytics intermediate staging** pattern to avoid Log Analytics memory limits (5GB) on large datasets and to produce a clean, single daily report with no duplication.
 
-1. **Initialize_Time_Chunks** — Creates an array of 12 time chunks, each covering 2 hours with a `blobName` property (e.g., `chargeBack-chunk-01-21h-23h.csv`)
-2. **Process_Time_Chunks** (ForEach loop, sequential) — For each chunk:
-   - **Submit_Chunk_Query** — Sends KQL query with `Prefer: wait=0` for async execution
-   - **Check_Chunk_Sync_Or_Async** — Branches on HTTP 200 (sync) vs 202 (async):
-     - **200 path**: `Set_Chunk_Sync_Results` captures inline results
-     - **202 path**: `Get_Poll_Location` → `Wait_Before_Poll` → `Poll_Chunk_Results` loop
+Instead of running a single 24-hour query, it splits the time range into **12 x 2-hour chunks**, stages the results in a custom Log Analytics table (`ChargeBackChunks_CL`), and then re-aggregates them into one daily CSV:
+
+### Phase 1 — Chunk Queries (Per-Chunk Loop)
+
+1. **Initialize_Time_Chunks** — Creates an array of 12 time chunks (2 hours each)
+2. **Initialize_Report_Date** / **Initialize_Workflow_Run_Id** / **Initialize_Expected_Chunk_Count** — Set up run-scoped variables
+3. **Process_Time_Chunks** (ForEach loop, sequential) — For each chunk:
+   - **Submit_Chunk_Query** — Sends KQL query against the source APIM workspace with `Prefer: wait=0`
+   - **Check_Chunk_Sync_Or_Async** — Branches on HTTP 200 (sync) vs 202 (async; polls until complete)
    - **Get_Chunk_Results** — Selects final results from whichever path completed
    - **Transform_Chunk_To_Objects** — Converts columnar query results to named objects
-   - **Create_Chunk_CSV** — Converts chunk results to CSV format
-   - **Delete_Existing_Blob** — Removes existing blob (allows overwrite)
-   - **Write_Chunk_Blob** — Creates new blob with chunk data
+   - **Enrich_Chunk_Rows** — Adds `ReportDate`, `WorkflowRunId`, and `ChunkId` to every row
+   - **Write_Chunk_To_Logs_If_Has_Rows** (If condition):
+     - **true**: `Write_Chunk_To_Logs` (HTTP POST to Logs Ingestion API → `ChargeBackChunks_CL`) + `Increment_Expected_Chunk_Count`
+     - **false**: no-op (skips empty chunks to avoid 400 errors)
 
-**Output Files** — 12 separate CSV files per run:
-- `chargeBack-chunk-01-21h-23h.csv` through `chargeBack-chunk-12-19h-21h.csv`
-- Each file contains pre-aggregated data for its 2-hour window
-- Files are overwritten on each subsequent run
+### Phase 2 — Ingestion Polling
+
+4. **Wait_Before_Ingestion_Poll** — 30-second initial pause
+5. **Poll_For_Ingestion** (Until loop) — Polls `ChargeBackChunks_CL` every 30 seconds until `dcount(ChunkId) >= ExpectedChunkCount` (i.e., all written chunks are queryable). Times out after 20 minutes and continues regardless.
+
+### Phase 3 — Daily Aggregation
+
+6. **Submit_Daily_Query** — Queries `ChargeBackChunks_CL` (error workspace), filtered by `WorkflowRunId` and `ReportDate`, to re-aggregate all 12 chunks into a single daily summary
+7. **Check_Daily_Sync_Or_Async** — Async polling pattern (same as chunk queries)
+8. **Get_Daily_Results** → **Transform_Daily_To_Objects** → **Create_Daily_CSV**
+9. **Write_Daily_Report_Blob** — Writes one CSV to blob storage with a date-time-stamped filename: `chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
+
+**Output** — One CSV file per run:
+- `reportoutput/chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
+- Contains fully aggregated daily data (all 2-hour windows combined)
+- Each run produces a unique file; previous runs are preserved
 
 **Error Handlers** (run on failure/timeout of upstream actions):
-- **Handle_Query_Failure** — Logs query errors to a custom Log Analytics table via Data Collection Rules
-- **Handle_Blob_Write_Failure** — Logs blob write errors to the same custom table
+- **Handle_Query_Failure** — Logs query errors to `WorkflowFailures_CL` via Data Collection Rules
+- **Handle_Blob_Write_Failure** — Logs blob write errors to the same table
 
-### Why Time Chunking + Separate Blobs?
+### Why Time Chunking + Intermediate Staging?
 
-Log Analytics queries have a 5GB memory limit for joins. With high-volume APIM traffic, joining `ApiManagementGatewayLogs` with `ApiManagementGatewayLlmLog` over 24 hours can exceed this limit, resulting in error `-2133196799`. By splitting into 2-hour chunks:
-- Each chunk stays under the memory limit
+Log Analytics queries have a 5GB memory limit for joins. With high-volume APIM traffic, joining `ApiManagementGatewayLogs` with `ApiManagementGatewayLlmLog` over 24 hours can exceed this limit, resulting in error `-2133196799`. By splitting into 2-hour chunks and staging in `ChargeBackChunks_CL`:
+- Each chunk query stays under the memory limit
 - The `hint.strategy=shuffle` hint distributes join processing across nodes
-- Each chunk is pre-aggregated in KQL before writing to blob
-- Downstream consumers can aggregate across chunk files as needed
+- All chunks are re-aggregated in a single final KQL query — no fan-out merge required in the Logic App
+- `WorkflowRunId` tagging enables idempotent re-runs: re-running on the same day produces a new timestamped file without corrupting previous runs
+- The Logs Ingestion API ingestion step is fault-tolerant: if ingestion is slow, the poll loop waits up to 20 minutes before proceeding
 
 This approach is a pure Logic App solution with no external dependencies on Azure Functions or JavaScript code actions, ensuring compatibility with .NET-based Logic App Standard runtimes
 
@@ -198,11 +215,12 @@ az logicapp restart --name <your-logic-app-name> --resource-group <your-resource
 | Logic App | `logic-chargeback-{suffix}` | Workflow engine |
 | Logic App Storage | `lacb{suffix}` | Internal runtime storage (key-based auth required) |
 | Report Storage | `rptcb{suffix}` | CSV report output (managed identity only, no keys) |
-| Blob Container | `reportoutput` | Container for 12 daily chunk CSV reports |
-| Log Analytics Workspace | `law-chargeback-{suffix}` | Error logging |
+| Blob Container | `reportoutput` | Container for daily CSV reports |
+| Log Analytics Workspace | `law-chargeback-{suffix}` | Error logging and chunk staging |
 | Custom Table | `WorkflowFailures_CL` | Schema for workflow error records |
+| Custom Table | `ChargeBackChunks_CL` | Intermediate staging for 12 chunk results per run |
 | Data Collection Endpoint | `dce-chargeback-{suffix}` | Log ingestion endpoint |
-| Data Collection Rule | `dcr-chargeback-{suffix}` | Routes errors to custom table |
+| Data Collection Rule | `dcr-chargeback-{suffix}` | Routes errors + chunk data to custom tables |
 
 ### API Connections (via PowerShell)
 
@@ -217,82 +235,71 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 | Role | Scope | Purpose | Assigned By |
 |------|-------|---------|-------------|
 | Storage Blob Data Contributor | Report storage account | Write CSV reports | Bicep |
-| Monitoring Metrics Publisher | Data Collection Rule | Ingest error logs | Bicep |
+| Monitoring Metrics Publisher | Data Collection Rule | Ingest error logs and chunk data | Bicep |
 | Monitoring Metrics Publisher | Data Collection Endpoint | Send logs to DCE | Bicep |
 | Log Analytics Reader | Source workspace | Query LLM logs | Bicep + PowerShell |
+| Log Analytics Reader | Error workspace | Query `ChargeBackChunks_CL` for ingestion polling and daily aggregation | Bicep |
 | Reader | Source workspace | Read workspace metadata | PowerShell |
 | Website Contributor | Logic App resource | Dynamic schema retrieval | PowerShell |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ Resource Group                                                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌──────────────────┐                                                  │
-│  │  User-Assigned   │◀─── Used by Logic App & API Connections          │
-│  │ Managed Identity │                                                  │
-│  └────────┬─────────┘                                                  │
-│           │                                                             │
-│           ▼                                                             │
-│  ┌────────────────────────────────────────────────────────────────┐    │
-│  │ Logic App (Standard)                                           │    │
-│  │                                                                │    │
-│  │  ┌─ CreateChargeBackReport ─────────────────────────────────┐  │    │
-│  │  │ Recurrence Trigger (every 24h)                           │  │    │
-│  │  │        │                                                 │  │    │
-│  │  │        ▼                                                 │  │    │
-│  │  │ Initialize_Time_Chunks (12 x 2-hour chunks w/ blobName)  │  │    │
-│  │  │        │                                                 │  │    │
-│  │  │        ▼                                                 │  │    │
-│  │  │ ┌─ Process_Time_Chunks (ForEach, sequential) ─────────┐  │  │    │
-│  │  │ │                                                     │  │  │    │
-│  │  │ │  Submit_Chunk_Query (HTTP POST, Prefer: wait=0)     │  │  │    │
-│  │  │ │         │                                           │  │  │    │
-│  │  │ │     ┌───┴───┐                                       │  │  │    │
-│  │  │ │   200?    202?                                      │  │  │    │
-│  │  │ │     │       │                                       │  │  │    │
-│  │  │ │   Sync   Poll_Chunk_Results (Until loop)            │  │  │    │
-│  │  │ │   Path   (15s intervals, max 60 iterations)         │  │  │    │
-│  │  │ │     │       │                                       │  │  │    │
-│  │  │ │     └───┬───┘                                       │  │  │    │
-│  │  │ │         ▼                                           │  │  │    │
-│  │  │ │  Get_Chunk_Results                                  │  │  │    │
-│  │  │ │         │                                           │  │  │    │
-│  │  │ │         ▼                                           │  │  │    │
-│  │  │ │  Transform_Chunk_To_Objects (Select)                │  │  │    │
-│  │  │ │         │                                           │  │  │    │
-│  │  │ │         ▼                                           │  │  │    │
-│  │  │ │  Create_Chunk_CSV (Table)                           │  │  │    │
-│  │  │ │         │                                           │  │  │    │
-│  │  │ │         ▼                                           │  │  │    │
-│  │  │ │  Delete_Existing_Blob → Write_Chunk_Blob            │  │  │    │
-│  │  │ │         │               (one per chunk)             │  │  │    │
-│  │  │ │         ▼                                           │  │  │    │
-│  │  │ │  ───────────────────────────────────────────        │  │  │    │
-│  │  │ │  Output: chargeBack-chunk-{NN}-{start}h-{end}h.csv  │  │  │    │
-│  │  │ └─────────────────────────────────────────────────────┘  │  │    │
-│  │  └──────────────────────────────────────────────────────────┘  │    │
-│  └────────────────────────────────────────────────────────────────┘    │
-│           │                                                            │
-│           ▼                                                            │
-│  ┌──────────────────┐  ┌────────────────────────────────────┐         │
-│  │ Storage (lacb*)  │  │ Storage (rptcb*)                   │         │
-│  │ Internal/Runtime │  │ reportoutput/                      │         │
-│  │ (Key Auth)       │  │   chargeBack-chunk-01-21h-23h.csv  │         │
-│  └──────────────────┘  │   chargeBack-chunk-02-23h-01h.csv  │         │
-│                        │   ...                               │         │
-│                        │   chargeBack-chunk-12-19h-21h.csv  │         │
-│                        │ (Managed ID Only, 12 files/run)    │         │
-│                        └────────────────────────────────────┘         │
-│                                                                        │
-│  ┌──────────────────┐  ┌──────────────────┐                           │
-│  │ DCE/DCR          │─▶│ Error Workspace  │                           │
-│  │ Error Logging    │  │ WorkflowFailures │                           │
-│  └──────────────────┘  │ _CL              │                           │
-│                        └──────────────────┘                           │
-└─────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Resource Group                                                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────┐                                                       │
+│  │  User-Assigned   │◀─── Used by Logic App & API Connections               │
+│  │ Managed Identity │                                                       │
+│  └────────┬─────────┘                                                       │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Logic App (Standard)                                                │   │
+│  │  ┌─ CreateChargeBackReport ──────────────────────────────────────┐  │   │
+│  │  │ Recurrence Trigger (every 24h)                                │  │   │
+│  │  │   │                                                           │  │   │
+│  │  │   ▼  Initialize_Time_Chunks / ReportDate / WorkflowRunId /    │  │   │
+│  │  │      ExpectedChunkCount                                       │  │   │
+│  │  │   │                                                           │  │   │
+│  │  │   ▼                                                           │  │   │
+│  │  │ ┌─ Process_Time_Chunks (ForEach, sequential) ──────────────┐  │  │   │
+│  │  │ │  Submit_Chunk_Query (Prefer: wait=0)                     │  │  │   │
+│  │  │ │    │ 200 (sync) / 202 (async → Poll_Chunk_Results)       │  │  │   │
+│  │  │ │  Get_Chunk_Results → Transform_Chunk_To_Objects          │  │  │   │
+│  │  │ │  Enrich_Chunk_Rows (adds ReportDate/WorkflowRunId/Chunk) │  │  │   │
+│  │  │ │  Write_Chunk_To_Logs_If_Has_Rows                         │  │  │   │
+│  │  │ │    ├─[has rows]─▶ Write_Chunk_To_Logs (DCE/DCR)          │  │  │   │
+│  │  │ │    │               + Increment_Expected_Chunk_Count      │  │  │   │
+│  │  │ │    └─[empty]────▶ (no-op)                                │  │  │   │
+│  │  │ └─────────────────────────────────────────────────────────┘  │  │   │
+│  │  │   │                                                           │  │   │
+│  │  │   ▼ Wait_Before_Ingestion_Poll (30s)                          │  │   │
+│  │  │   ▼ Poll_For_Ingestion (Until dcount(ChunkId)>=Expected,      │  │   │
+│  │  │                         30s interval, 20min timeout)          │  │   │
+│  │  │   │                                                           │  │   │
+│  │  │   ▼ Submit_Daily_Query (ChargeBackChunks_CL, by WorkflowRunId)│  │   │
+│  │  │   ▼ Check_Daily_Sync_Or_Async → Get_Daily_Results            │  │   │
+│  │  │   ▼ Transform_Daily_To_Objects → Create_Daily_CSV            │  │   │
+│  │  │   ▼ Write_Daily_Report_Blob                                  │  │   │
+│  │  │     Output: chargeBack-daily-YYYY-MM-DD-HHmmss.csv           │  │   │
+│  │  └──────────────────────────────────────────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│           │                                                                │
+│  ┌────────┴───────┐  ┌────────────────────────────────────────┐           │
+│  │ Storage (lacb*)│  │ Storage (rptcb*)                       │           │
+│  │ Internal       │  │ reportoutput/                          │           │
+│  │ (Key Auth)     │  │   chargeBack-daily-2026-03-09-143022.csv│           │
+│  └────────────────┘  │ (Managed ID Only, 1 file per run)     │           │
+│                      └────────────────────────────────────────┘           │
+│                                                                            │
+│  ┌────────────────┐  ┌────────────────────────────────────────┐           │
+│  │ DCE/DCR        │─▶│ Error Workspace (law-chargeback-*)      │           │
+│  │ (two streams)  │  │  WorkflowFailures_CL  (error logs)     │           │
+│  └────────────────┘  │  ChargeBackChunks_CL  (chunk staging)  │           │
+│                      └────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────────────────┘
             │
             ▼
 ┌──────────────────────────────────┐
@@ -304,9 +311,11 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 └──────────────────────────────────┘
 ```
 
-## KQL Query
+## KQL Queries
 
-The workflow executes this optimized query against the source Log Analytics workspace for each 2-hour time chunk:
+### Chunk Query (Source Workspace — runs 12 times per workflow execution)
+
+Executed against the **source Log Analytics workspace** (APIM logs) for each 2-hour time chunk. Results are staged into `ChargeBackChunks_CL` via the Logs Ingestion API:
 
 ```kql
 // Compute time window: covers 24h ending at REPORT_END_HOUR yesterday
@@ -379,6 +388,35 @@ ApiManagementGatewayLogs
 | order by ProductId asc, TotalTokens desc
 ```
 
+### Daily Aggregation Query (Error Workspace — runs once per workflow execution)
+
+Executed against the **error workspace** (`ChargeBackChunks_CL`) after all chunks have been ingested. Combines all 12 chunk summaries into a single daily total per ProductId + Deployment, filtered by `WorkflowRunId` to prevent duplication on re-runs:
+
+```kql
+let runId = '<WorkflowRunId>';
+let reportDate = '<ReportDate>';
+union isfuzzy=true ChargeBackChunks_CL
+| where ReportDate == reportDate and WorkflowRunId == runId
+| summarize
+    TotalTokens      = sum(TotalTokens),
+    CompletionTokens = sum(CompletionTokens),
+    PromptTokens     = sum(PromptTokens),
+    FirstSeen        = min(FirstSeen),
+    LastSeen         = max(LastSeen),
+    Regions          = strcat_array(make_set(Regions), '; '),
+    CallerIpAddresses = strcat_array(make_set(CallerIpAddresses), '; '),
+    Calls            = sum(Calls)
+    by ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName,
+       SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint
+| project ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName,
+          SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint,
+          PromptTokens, CompletionTokens, TotalTokens, Calls,
+          FirstSeen, LastSeen, Regions, CallerIpAddresses
+| order by ProductId asc, TotalTokens desc
+```
+
+`isfuzzy=true` is used to handle the case where `ChargeBackChunks_CL` does not yet exist or has not propagated on the first run.
+
 ### Query Optimizations
 
 1. **Pre-aggregation** (`let llmAgg = ...`) — Aggregates token counts by CorrelationId BEFORE the join, reducing the dataset size at join time
@@ -418,8 +456,14 @@ The `Transform_Chunk_To_Objects` action maps the columnar result to named fields
 
 ### Monitor
 
-- **Report Output**: Check blob storage container `reportoutput` for 12 chunk files (`chargeBack-chunk-*.csv`)
-- **Workflow Runs**: View run history in Logic App portal → Workflows → CreateChargeBackReport
+- **Report Output**: Check blob storage container `reportoutput` for daily files (`chargeBack-daily-*.csv`). Each workflow run produces one file with a unique date-time stamp, preserving history across re-runs
+- **Workflow Runs**: View run history in Logic App portal → Workflows → CreateChargeBackReport- **Chunk Staging**: Query `ChargeBackChunks_CL` in the error workspace to inspect staged data per run:
+
+```kql
+ChargeBackChunks_CL
+| summarize Chunks = dcount(ChunkId), Rows = count() by WorkflowRunId, ReportDate
+| order by ReportDate desc
+```
 - **Error Logs**: Query `WorkflowFailures_CL` table in error workspace:
 
 ```kql
@@ -446,9 +490,19 @@ If connections show as "Invalid" or "Forbidden":
 ### Query Failures (InsufficientAccessError)
 
 - Verify the source workspace name and resource group are correct in `deploy-infrastructure.bicepparam`
-- Confirm the managed identity has both **Log Analytics Reader** and **Reader** roles on the source workspace
-- Ensure `ApiManagementGatewayLogs`, `ApiManagementGatewayLlmLog`, and `CognitiveServicesInventory_CL` tables exist in the workspace
+- Confirm the managed identity has both **Log Analytics Reader** and **Reader** roles on the **source workspace**
+- Confirm the managed identity has **Log Analytics Reader** on the **error workspace** (`law-chargeback-{suffix}`) — required for `Poll_For_Ingestion` and `Submit_Daily_Query`
+- Ensure `ApiManagementGatewayLogs`, `ApiManagementGatewayLlmLog`, and `CognitiveServicesInventory_CL` tables exist in the source workspace
 - Restart the Logic App after RBAC changes
+
+### Ingestion Polling Timeout
+
+If `Poll_For_Ingestion` times out (20 minutes) without seeing all expected chunks:
+- Check `Check_Ingestion_Count` action outputs in the run history — the response body will show the `IngestedChunks` count vs. `ExpectedChunkCount`
+- Verify `Write_Chunk_To_Logs` succeeded for each chunk (if a chunk write failed, `ExpectedChunkCount` will not include it)
+- First-time ingestion into a new `ChargeBackChunks_CL` table can take up to 30 minutes. Subsequent runs are typically 2–5 minutes
+- `Submit_Daily_Query` still runs after timeout (`runAfter: [Succeeded, TimedOut]`) and will succeed once data has landed
+- To query manually: `ChargeBackChunks_CL | summarize dcount(ChunkId) by WorkflowRunId` in the error workspace
 
 ### Query Failures (Memory Limit Error -2133196799)
 
@@ -575,17 +629,12 @@ Edit `Recurrence` trigger:
 
 ### Modify Blob Naming
 
-Each chunk's blob name is defined in the `Initialize_Time_Chunks` array. To change the naming pattern, edit the `blobName` property for each chunk:
-```json
-{
-  "chunkId": 1,
-  "hoursAgo": 24,
-  "hoursUntil": 22,
-  "blobName": "chargeBack-chunk-01-21h-23h.csv"
-}
+The daily output filename is built in the `Write_Daily_Report_Blob` action:
+```
+chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv
 ```
 
-The naming convention uses the time window (relative to the report end hour) in the filename to make it easy to identify each chunk's coverage period.
+Each run produces a unique file. Previous runs are preserved. To change the pattern, edit the `name` field in the `queries` block of `Write_Daily_Report_Blob` in `CreateChargeBackReport/workflow.json`.
 
 ## Files
 
@@ -616,7 +665,7 @@ PTUChargeBackWorkflow/
 
 3. **Async Query Pattern**: The workflow uses the Log Analytics REST API with `Prefer: wait=0` rather than the managed API connector, enabling asynchronous query execution to avoid HTTP timeouts on large datasets.
 
-4. **Time Chunking with Separate Blobs**: To avoid the 5GB memory limit on Log Analytics joins, the workflow splits queries into 12 x 2-hour chunks. Each chunk's results are written to a separate blob file. Downstream consumers aggregate the 12 files as needed. This approach avoids complex in-Logic-App aggregation and ensures .NET runtime compatibility.
+4. **Time Chunking with Intermediate Staging**: To avoid the 5GB memory limit on Log Analytics joins, the workflow splits queries into 12 x 2-hour chunks. Each chunk is written to `ChargeBackChunks_CL` (error workspace) via the Logs Ingestion API, then re-aggregated by a single KQL query into one daily CSV. A smart polling loop waits up to 20 minutes for all chunks to become queryable before running the final aggregation. `WorkflowRunId` tagging makes re-runs idempotent — each run writes a uniquely named output file.
 
 5. **Pre-Aggregation in KQL**: The KQL query pre-aggregates the `ApiManagementGatewayLlmLog` table before joining, and uses `strcat_array(make_set(...), '; ')` to produce string fields for Regions and CallerIpAddresses, ensuring CSV compatibility.
 

@@ -41,9 +41,63 @@
         },
         "runAfter": {}
       },
+      "Initialize_Report_Date": {
+        "type": "InitializeVariable",
+        "description": "Initialize the report date (yesterday) for filtering Log Analytics data and naming the daily blob.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "ReportDate",
+              "type": "string",
+              "value": "@{formatDateTime(subtractFromTime(utcNow(), 1, 'Day'), 'yyyy-MM-dd')}"
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Time_Chunks": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Workflow_Run_Id": {
+        "type": "InitializeVariable",
+        "description": "Capture this run's unique ID. Written into every chunk row in ChargeBackChunks_CL so the final summary query can isolate exactly this run's data, preventing duplication from re-runs on the same day.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "WorkflowRunId",
+              "type": "string",
+              "value": "@{workflow().run.id}"
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Report_Date": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Expected_Chunk_Count": {
+        "type": "InitializeVariable",
+        "description": "Counts how many chunks actually had data and wrote to ChargeBackChunks_CL. Used by the ingestion polling loop to know when all written chunks have been ingested.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "ExpectedChunkCount",
+              "type": "integer",
+              "value": 0
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Workflow_Run_Id": [
+            "Succeeded"
+          ]
+        }
+      },
       "Process_Time_Chunks": {
         "type": "Foreach",
-        "description": "Process each 2-hour chunk: query, transform, create CSV, write blob.",
+        "description": "Process each 2-hour chunk: query Log Analytics, transform rows, enrich with run metadata, and write to ChargeBackChunks_CL via the Logs Ingestion API.",
         "foreach": "@variables('TimeChunks')",
         "actions": {
           "Submit_Chunk_Query": {
@@ -215,12 +269,37 @@
               ]
             }
           },
-          "Create_Chunk_CSV": {
-            "type": "Table",
-            "description": "Create CSV from this chunk's data.",
+          "Enrich_Chunk_Rows": {
+            "type": "Select",
+            "description": "Add ReportDate, WorkflowRunId, ChunkId, and TimeGenerated to every row before writing to ChargeBackChunks_CL.",
             "inputs": {
               "from": "@body('Transform_Chunk_To_Objects')",
-              "format": "CSV"
+              "select": {
+                "TimeGenerated": "@{utcNow()}",
+                "ReportDate": "@{variables('ReportDate')}",
+                "WorkflowRunId": "@{variables('WorkflowRunId')}",
+                "ChunkId": "@{items('Process_Time_Chunks')['chunkId']}",
+                "ProductId": "@item()['ProductId']",
+                "Luma": "@item()['Luma']",
+                "Workspace": "@item()['Workspace']",
+                "DeploymentName": "@item()['DeploymentName']",
+                "ModelName": "@item()['ModelName']",
+                "AccountName": "@item()['AccountName']",
+                "SubscriptionId": "@item()['SubscriptionId']",
+                "ResourceID": "@item()['ResourceID']",
+                "SkuName": "@item()['SkuName']",
+                "SkuCapacity": "@item()['SkuCapacity']",
+                "BackendId": "@item()['BackendId']",
+                "Endpoint": "@item()['Endpoint']",
+                "PromptTokens": "@item()['PromptTokens']",
+                "CompletionTokens": "@item()['CompletionTokens']",
+                "TotalTokens": "@item()['TotalTokens']",
+                "Calls": "@item()['Calls']",
+                "FirstSeen": "@item()['FirstSeen']",
+                "LastSeen": "@item()['LastSeen']",
+                "Regions": "@item()['Regions']",
+                "CallerIpAddresses": "@item()['CallerIpAddresses']"
+              }
             },
             "runAfter": {
               "Transform_Chunk_To_Objects": [
@@ -228,66 +307,357 @@
               ]
             }
           },
-          "Delete_Existing_Blob": {
-            "type": "ApiConnection",
-            "description": "Delete existing blob if present (to allow overwrite).",
-            "inputs": {
-              "host": {
-                "connection": {
-                  "referenceName": "azureblob"
+          "Write_Chunk_To_Logs_If_Has_Rows": {
+            "type": "If",
+            "description": "Only POST to Log Analytics if this chunk has rows. The Logs Ingestion API returns 400 for empty arrays.",
+            "expression": {
+              "and": [
+                {
+                  "greater": [
+                    "@length(body('Enrich_Chunk_Rows'))",
+                    0
+                  ]
                 }
+              ]
+            },
+            "actions": {
+              "Write_Chunk_To_Logs": {
+                "type": "Http",
+                "description": "POST this chunk's enriched rows to ChargeBackChunks_CL via the Logs Ingestion API. Tagged with WorkflowRunId to enable idempotent daily re-aggregation.",
+                "inputs": {
+                  "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-ChargeBackChunksStream?api-version=2023-01-01",
+                  "method": "POST",
+                  "headers": {
+                    "Content-Type": "application/json"
+                  },
+                  "body": "@body('Enrich_Chunk_Rows')",
+                  "authentication": {
+                    "type": "ManagedServiceIdentity",
+                    "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                    "audience": "https://monitor.azure.com"
+                  }
+                },
+                "runAfter": {}
               },
-              "method": "delete",
-              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files/@{encodeURIComponent(encodeURIComponent(concat('reportoutput/', items('Process_Time_Chunks')['blobName'])))}"
+              "Increment_Expected_Chunk_Count": {
+                "type": "IncrementVariable",
+                "description": "Track that this chunk successfully wrote to ChargeBackChunks_CL, so the ingestion poll knows the exact target count.",
+                "inputs": {
+                  "name": "ExpectedChunkCount",
+                  "value": 1
+                },
+                "runAfter": {
+                  "Write_Chunk_To_Logs": [
+                    "Succeeded"
+                  ]
+                }
+              }
+            },
+            "else": {
+              "actions": {}
             },
             "runAfter": {
-              "Create_Chunk_CSV": [
+              "Enrich_Chunk_Rows": [
                 "Succeeded"
               ]
-            }
-          },
-          "Write_Chunk_Blob": {
-            "type": "ApiConnection",
-            "description": "Write this chunk's CSV to blob storage.",
-            "inputs": {
-              "host": {
-                "connection": {
-                  "referenceName": "azureblob"
-                }
-              },
-              "method": "post",
-              "body": "@body('Create_Chunk_CSV')",
-              "headers": {
-                "ReadFileMetadataFromServer": true
-              },
-              "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
-              "queries": {
-                "folderPath": "reportoutput",
-                "name": "@{items('Process_Time_Chunks')['blobName']}",
-                "queryParametersSingleEncoded": true
-              }
-            },
-            "runAfter": {
-              "Delete_Existing_Blob": [
-                "Succeeded",
-                "Failed"
-              ]
-            },
-            "runtimeConfiguration": {
-              "contentTransfer": {
-                "transferMode": "Chunked"
-              }
             }
           }
         },
         "runAfter": {
-          "Initialize_Time_Chunks": [
+          "Initialize_Expected_Chunk_Count": [
             "Succeeded"
           ]
         },
         "runtimeConfiguration": {
           "concurrency": {
             "repetitions": 1
+          }
+        }
+      },
+      "Wait_Before_Ingestion_Poll": {
+        "type": "Wait",
+        "description": "Initial 30-second pause before starting ingestion polling. Gives the Logs Ingestion API a head start before the first count check.",
+        "inputs": {
+          "interval": {
+            "count": 30,
+            "unit": "Second"
+          }
+        },
+        "runAfter": {
+          "Process_Time_Chunks": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Poll_For_Ingestion": {
+        "type": "Until",
+        "description": "Poll ChargeBackChunks_CL every 30 seconds until the number of distinct ingested ChunkIds matches ExpectedChunkCount. Exits immediately if ExpectedChunkCount is 0 (all chunks were empty). Times out after 20 minutes.",
+        "expression": "@greaterOrEquals(coalesce(body('Check_Ingestion_Count')?['tables']?[0]?['rows']?[0]?[0], 0), variables('ExpectedChunkCount'))",
+        "limit": {
+          "count": 40,
+          "timeout": "PT20M"
+        },
+        "actions": {
+          "Check_Ingestion_Count": {
+            "type": "Http",
+            "description": "Query ChargeBackChunks_CL for the count of distinct ChunkIds written by this run. Uses isfuzzy=true in case the table is not yet queryable.",
+            "inputs": {
+              "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('ERROR_WORKSPACE_ID')}/query",
+              "method": "POST",
+              "headers": {
+                "Content-Type": "application/json",
+                "Prefer": "wait=600"
+              },
+              "body": {
+                "query": "union isfuzzy=true ChargeBackChunks_CL | where WorkflowRunId == '@{variables('WorkflowRunId')}' | summarize IngestedChunks = dcount(ChunkId)"
+              },
+              "authentication": {
+                "type": "ManagedServiceIdentity",
+                "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                "audience": "https://api.loganalytics.io"
+              }
+            },
+            "runAfter": {}
+          },
+          "Delay_Ingestion_Poll": {
+            "type": "Wait",
+            "description": "Wait 30 seconds before the next ingestion count check.",
+            "inputs": {
+              "interval": {
+                "count": 30,
+                "unit": "Second"
+              }
+            },
+            "runAfter": {
+              "Check_Ingestion_Count": [
+                "Succeeded",
+                "Failed"
+              ]
+            }
+          }
+        },
+        "runAfter": {
+          "Wait_Before_Ingestion_Poll": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Submit_Daily_Query": {
+        "type": "Http",
+        "description": "Re-aggregate this run's 12 chunk summaries from ChargeBackChunks_CL into a single daily total per ProductId + Deployment. Filtered by WorkflowRunId to prevent duplication if the workflow is re-run on the same day.",
+        "inputs": {
+          "uri": "https://api.loganalytics.io/v1/workspaces/@{appsetting('ERROR_WORKSPACE_ID')}/query",
+          "method": "POST",
+          "headers": {
+            "Content-Type": "application/json",
+            "Prefer": "wait=0"
+          },
+          "body": {
+            "query": "let runId = '@{variables('WorkflowRunId')}'; let reportDate = '@{variables('ReportDate')}'; union isfuzzy=true ChargeBackChunks_CL | where ReportDate == reportDate and WorkflowRunId == runId | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(FirstSeen), LastSeen = max(LastSeen), Regions = strcat_array(make_set(Regions), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddresses), '; '), Calls = sum(Calls) by ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName, SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint | project ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName, SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
+          },
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "audience": "https://api.loganalytics.io"
+          }
+        },
+        "runAfter": {
+          "Poll_For_Ingestion": [
+            "Succeeded",
+            "TimedOut"
+          ]
+        },
+        "runtimeConfiguration": {
+          "contentTransfer": {
+            "transferMode": "Chunked"
+          }
+        }
+      },
+      "Check_Daily_Sync_Or_Async": {
+        "type": "If",
+        "description": "If 200, daily summary query completed synchronously. If 202, poll for results.",
+        "expression": {
+          "and": [
+            {
+              "equals": [
+                "@outputs('Submit_Daily_Query')['statusCode']",
+                200
+              ]
+            }
+          ]
+        },
+        "actions": {
+          "Set_Daily_Sync_Results": {
+            "type": "Compose",
+            "inputs": "@body('Submit_Daily_Query')"
+          }
+        },
+        "else": {
+          "actions": {
+            "Get_Daily_Poll_Location": {
+              "type": "Compose",
+              "inputs": "@outputs('Submit_Daily_Query')['headers']?['location']",
+              "runAfter": {}
+            },
+            "Wait_Before_Daily_Poll": {
+              "type": "Wait",
+              "inputs": {
+                "interval": {
+                  "count": 10,
+                  "unit": "Second"
+                }
+              },
+              "runAfter": {
+                "Get_Daily_Poll_Location": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Poll_Daily_Results": {
+              "type": "Until",
+              "expression": "@not(equals(outputs('Check_Daily_Status')['statusCode'], 202))",
+              "limit": {
+                "count": 60,
+                "timeout": "PT10M"
+              },
+              "actions": {
+                "Check_Daily_Status": {
+                  "type": "Http",
+                  "inputs": {
+                    "uri": "@outputs('Get_Daily_Poll_Location')",
+                    "method": "GET",
+                    "authentication": {
+                      "type": "ManagedServiceIdentity",
+                      "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                      "audience": "https://api.loganalytics.io"
+                    }
+                  },
+                  "runAfter": {}
+                },
+                "Delay_Daily_Poll": {
+                  "type": "Wait",
+                  "inputs": {
+                    "interval": {
+                      "count": 5,
+                      "unit": "Second"
+                    }
+                  },
+                  "runAfter": {
+                    "Check_Daily_Status": [
+                      "Succeeded"
+                    ]
+                  }
+                }
+              },
+              "runAfter": {
+                "Wait_Before_Daily_Poll": [
+                  "Succeeded"
+                ]
+              }
+            },
+            "Set_Daily_Async_Results": {
+              "type": "Compose",
+              "inputs": "@body('Check_Daily_Status')",
+              "runAfter": {
+                "Poll_Daily_Results": [
+                  "Succeeded"
+                ]
+              }
+            }
+          }
+        },
+        "runAfter": {
+          "Submit_Daily_Query": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Get_Daily_Results": {
+        "type": "Compose",
+        "description": "Get the final daily summary query results (from sync or async path).",
+        "inputs": "@if(equals(outputs('Submit_Daily_Query')['statusCode'], 200), outputs('Set_Daily_Sync_Results'), outputs('Set_Daily_Async_Results'))",
+        "runAfter": {
+          "Check_Daily_Sync_Or_Async": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Transform_Daily_To_Objects": {
+        "type": "Select",
+        "description": "Transform the re-aggregated daily summary rows into named objects for CSV output.",
+        "inputs": {
+          "from": "@if(equals(outputs('Get_Daily_Results')?['tables']?[0]?['rows'], null), json('[]'), outputs('Get_Daily_Results')?['tables']?[0]?['rows'])",
+          "select": {
+            "ProductId": "@item()[0]",
+            "Luma": "@item()[1]",
+            "Workspace": "@item()[2]",
+            "DeploymentName": "@item()[3]",
+            "ModelName": "@item()[4]",
+            "AccountName": "@item()[5]",
+            "SubscriptionId": "@item()[6]",
+            "ResourceID": "@item()[7]",
+            "SkuName": "@item()[8]",
+            "SkuCapacity": "@item()[9]",
+            "BackendId": "@item()[10]",
+            "Endpoint": "@item()[11]",
+            "PromptTokens": "@item()[12]",
+            "CompletionTokens": "@item()[13]",
+            "TotalTokens": "@item()[14]",
+            "Calls": "@item()[15]",
+            "FirstSeen": "@item()[16]",
+            "LastSeen": "@item()[17]",
+            "Regions": "@item()[18]",
+            "CallerIpAddresses": "@item()[19]"
+          }
+        },
+        "runAfter": {
+          "Get_Daily_Results": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Create_Daily_CSV": {
+        "type": "Table",
+        "description": "Create the final daily CSV from the re-aggregated summary rows. Each row represents total token usage for a unique ProductId + Deployment combination across the full 24-hour period.",
+        "inputs": {
+          "from": "@body('Transform_Daily_To_Objects')",
+          "format": "CSV"
+        },
+        "runAfter": {
+          "Transform_Daily_To_Objects": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Write_Daily_Report_Blob": {
+        "type": "ApiConnection",
+        "description": "Write the daily CSV to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.csv). Each run produces a unique file, preserving history across re-runs.",
+        "inputs": {
+          "host": {
+            "connection": {
+              "referenceName": "azureblob"
+            }
+          },
+          "method": "post",
+          "body": "@body('Create_Daily_CSV')",
+          "headers": {
+            "ReadFileMetadataFromServer": true
+          },
+          "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
+          "queries": {
+            "folderPath": "reportoutput",
+            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv",
+            "queryParametersSingleEncoded": true
+          }
+        },
+        "runAfter": {
+          "Create_Daily_CSV": [
+            "Succeeded"
+          ]
+        },
+        "runtimeConfiguration": {
+          "contentTransfer": {
+            "transferMode": "Chunked"
           }
         }
       },
@@ -338,11 +708,11 @@
               "WorkflowName": "@{workflow().name}",
               "WorkflowRunId": "@{workflow().run.id}",
               "FailureType": "BlobWriteFailure",
-              "ActionName": "Write_Chunk_Blob",
+              "ActionName": "Write_Daily_Report_Blob",
               "ErrorCode": "BlobWriteError",
-              "ErrorMessage": "Failed to write one or more chunk blobs.",
+              "ErrorMessage": "Failed to write the daily report blob.",
               "Severity": "High",
-              "BlobPath": "reportoutput/"
+              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv"
             }
           ],
           "authentication": {
@@ -352,8 +722,7 @@
           }
         },
         "runAfter": {
-          "Process_Time_Chunks": [
-            "Succeeded",
+          "Write_Daily_Report_Blob": [
             "Failed"
           ]
         }
@@ -362,5 +731,14 @@
   },
   "kind": "Stateful"
 }
+
+
+
+
+
+
+
+
+
 
 
