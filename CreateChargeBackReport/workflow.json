@@ -49,7 +49,7 @@
             {
               "name": "ReportDate",
               "type": "string",
-              "value": "@{formatDateTime(subtractFromTime(utcNow(), 1, 'Day'), 'yyyy-MM-dd')}"
+              "value": "@{formatDateTime(utcNow(), 'yyyy-MM-dd')}"
             }
           ]
         },
@@ -629,9 +629,31 @@
           ]
         }
       },
+      "Zip_CSV": {
+        "type": "Http",
+        "description": "POST the daily CSV to the ZipCsv Azure Function, which compresses it into a ZIP archive and returns the zipped bytes.",
+        "inputs": {
+          "uri": "@{concat(appsetting('ZipCsvFunctionUrl'), '?filename=chargeBack-daily-', variables('ReportDate'), '-', formatDateTime(utcNow(), 'HHmmss'), '.csv')}",
+          "method": "POST",
+          "headers": {
+            "Content-Type": "text/csv"
+          },
+          "body": "@body('Create_Daily_CSV')",
+          "authentication": {
+            "type": "ManagedServiceIdentity",
+            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+            "audience": "{{ZIP_FUNCTION_AUDIENCE}}"
+          }
+        },
+        "runAfter": {
+          "Create_Daily_CSV": [
+            "Succeeded"
+          ]
+        }
+      },
       "Write_Daily_Report_Blob": {
         "type": "ApiConnection",
-        "description": "Write the daily CSV to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.csv). Each run produces a unique file, preserving history across re-runs.",
+        "description": "Write the daily ZIP archive to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.zip). Each run produces a unique file, preserving history across re-runs.",
         "inputs": {
           "host": {
             "connection": {
@@ -639,19 +661,19 @@
             }
           },
           "method": "post",
-          "body": "@body('Create_Daily_CSV')",
+          "body": "@body('Zip_CSV')",
           "headers": {
             "ReadFileMetadataFromServer": true
           },
           "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
           "queries": {
             "folderPath": "reportoutput",
-            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv",
+            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.zip",
             "queryParametersSingleEncoded": true
           }
         },
         "runAfter": {
-          "Create_Daily_CSV": [
+          "Zip_CSV": [
             "Succeeded"
           ]
         },
@@ -710,9 +732,9 @@
               "FailureType": "BlobWriteFailure",
               "ActionName": "Write_Daily_Report_Blob",
               "ErrorCode": "BlobWriteError",
-              "ErrorMessage": "Failed to write the daily report blob.",
+              "ErrorMessage": "Failed to compress or write the daily report.",
               "Severity": "High",
-              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv"
+              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.zip"
             }
           ],
           "authentication": {
@@ -722,6 +744,9 @@
           }
         },
         "runAfter": {
+          "Zip_CSV": [
+            "Failed"
+          ],
           "Write_Daily_Report_Blob": [
             "Failed"
           ]
@@ -731,6 +756,9 @@
   },
   "kind": "Stateful"
 }
+
+
+
 
 
 

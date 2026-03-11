@@ -22,6 +22,9 @@ var errorWorkspaceName = 'law-chargeback-${uniqueSuffix}'
 var dceEndpointName = 'dce-chargeback-${uniqueSuffix}'
 var dcrName = 'dcr-chargeback-${uniqueSuffix}'
 var userManagedIdentityName = 'id-chargeback-${uniqueSuffix}'
+var zipFunctionAppName = 'func-zipcsv-${uniqueSuffix}'
+var zipFunctionStorageAccountName = 'fnzip${uniqueSuffix}'
+var zipFunctionPlanName = 'asp-zipcsv-${uniqueSuffix}'
 
 // User Assigned Managed Identity
 resource userManagedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
@@ -92,10 +95,13 @@ resource reportContainer 'Microsoft.Storage/storageAccounts/blobServices/contain
 }
 
 // Logic App with user-assigned managed identity
+// dependsOn fileShare is explicit because logicApp does not reference it directly,
+// but ARM must not deploy the Logic App before the WEBSITE_CONTENTSHARE file share exists.
 resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
   name: logicAppName
   location: location
   kind: 'functionapp,workflowapp'
+  dependsOn: [fileShare]
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -180,9 +186,6 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
       use32BitWorkerProcess: false
     }
   }
-  dependsOn: [
-    fileShare
-  ]
 }
 
 // Log Analytics Workspace for error logging
@@ -254,6 +257,30 @@ resource chargeBackChunksTable 'Microsoft.OperationalInsights/workspaces/tables@
       ]
     }
   }
+}
+
+// Wait for custom table schemas to propagate before creating the DCR.
+// Azure sometimes reports tables as created before they are queryable by DCR validation.
+resource waitForCustomTables 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
+  name: 'wait-tables-${uniqueSuffix}'
+  location: location
+  kind: 'AzurePowerShell'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userManagedIdentity.id}': {}
+    }
+  }
+  properties: {
+    azPowerShellVersion: '11.0'
+    scriptContent: 'Start-Sleep -Seconds 60'
+    retentionInterval: 'PT1H'
+    cleanupPreference: 'OnSuccess'
+  }
+  dependsOn: [
+    customTable
+    chargeBackChunksTable
+  ]
 }
 
 // Data Collection Endpoint
@@ -340,8 +367,7 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
     ]
   }
   dependsOn: [
-    customTable
-    chargeBackChunksTable
+    waitForCustomTables
   ]
 }
 
@@ -399,6 +425,72 @@ module sourceWorkspaceRbac 'modules/logAnalyticsRbac.bicep' = {
   }
 }
 
+// Storage account for Zip CSV Function App (Consumption plan requires shared key access)
+resource zipFunctionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
+  name: zipFunctionStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    allowSharedKeyAccess: true
+    allowBlobPublicAccess: false
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+  }
+}
+
+// Consumption plan for Zip CSV Function App
+resource zipFunctionPlan 'Microsoft.Web/serverfarms@2022-09-01' = {
+  name: zipFunctionPlanName
+  location: location
+  sku: {
+    name: 'Y1'
+    tier: 'Dynamic'
+  }
+  kind: 'functionapp'
+}
+
+// Zip CSV Function App (.NET 8 isolated)
+resource zipFunctionApp 'Microsoft.Web/sites@2022-09-01' = {
+  name: zipFunctionAppName
+  location: location
+  kind: 'functionapp'
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    serverFarmId: zipFunctionPlan.id
+    httpsOnly: true
+    siteConfig: {
+      appSettings: [
+        {
+          name: 'AzureWebJobsStorage'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${zipFunctionStorage.name};AccountKey=${zipFunctionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+        {
+          name: 'WEBSITE_CONTENTAZUREFILECONNECTIONSTRING'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${zipFunctionStorage.name};AccountKey=${zipFunctionStorage.listKeys().keys[0].value};EndpointSuffix=${environment().suffixes.storage}'
+        }
+        {
+          name: 'WEBSITE_CONTENTSHARE'
+          value: toLower(zipFunctionAppName)
+        }
+        {
+          name: 'FUNCTIONS_EXTENSION_VERSION'
+          value: '~4'
+        }
+        {
+          name: 'FUNCTIONS_WORKER_RUNTIME'
+          value: 'dotnet-isolated'
+        }
+      ]
+      netFrameworkVersion: 'v10.0'
+    }
+  }
+}
+
 // Outputs
 output userManagedIdentityId string = userManagedIdentity.id
 output userManagedIdentityName string = userManagedIdentity.name
@@ -414,4 +506,5 @@ output errorWorkspaceId string = errorWorkspace.properties.customerId
 output sourceWorkspaceName string = sourceLogAnalyticsWorkspace
 output sourceWorkspaceResourceGroup string = sourceWorkspaceResourceGroup
 output sourceWorkspaceId string = sourceWorkspaceRbac.outputs.workspaceCustomerId
+output zipFunctionAppName string = zipFunctionApp.name
 
