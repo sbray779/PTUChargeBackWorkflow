@@ -616,29 +616,16 @@
           ]
         }
       },
-      "Create_Daily_CSV": {
-        "type": "Table",
-        "description": "Create the final daily CSV from the re-aggregated summary rows. Each row represents total token usage for a unique ProductId + Deployment combination across the full 24-hour period.",
-        "inputs": {
-          "from": "@body('Transform_Daily_To_Objects')",
-          "format": "CSV"
-        },
-        "runAfter": {
-          "Transform_Daily_To_Objects": [
-            "Succeeded"
-          ]
-        }
-      },
       "Zip_CSV": {
         "type": "Http",
-        "description": "POST the daily CSV to the ZipCsv Azure Function, which compresses it into a ZIP archive and returns the zipped bytes.",
+        "description": "POST the daily rows (JSON array) to the ZipCsv Azure Function, which converts them to a Parquet file and returns the bytes.",
         "inputs": {
-          "uri": "@{concat(appsetting('ZipCsvFunctionUrl'), '?filename=chargeBack-daily-', variables('ReportDate'), '-', formatDateTime(utcNow(), 'HHmmss'), '.csv')}",
+          "uri": "@{concat(appsetting('ZipCsvFunctionUrl'), '?filename=chargeBack-daily-', variables('ReportDate'), '-', formatDateTime(utcNow(), 'HHmmss'), '.parquet')}",
           "method": "POST",
           "headers": {
-            "Content-Type": "text/csv"
+            "Content-Type": "application/json"
           },
-          "body": "@body('Create_Daily_CSV')",
+          "body": "@body('Transform_Daily_To_Objects')",
           "authentication": {
             "type": "ManagedServiceIdentity",
             "identity": "{{USER_MANAGED_IDENTITY_ID}}",
@@ -646,14 +633,14 @@
           }
         },
         "runAfter": {
-          "Create_Daily_CSV": [
+          "Transform_Daily_To_Objects": [
             "Succeeded"
           ]
         }
       },
       "Write_Daily_Report_Blob": {
         "type": "ApiConnection",
-        "description": "Write the daily ZIP archive to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.zip). Each run produces a unique file, preserving history across re-runs.",
+        "description": "Write the daily Parquet file to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.parquet). Each run produces a unique file, preserving history across re-runs.",
         "inputs": {
           "host": {
             "connection": {
@@ -668,7 +655,7 @@
           "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
           "queries": {
             "folderPath": "reportoutput",
-            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.zip",
+            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.parquet",
             "queryParametersSingleEncoded": true
           }
         },
@@ -732,9 +719,9 @@
               "FailureType": "BlobWriteFailure",
               "ActionName": "Write_Daily_Report_Blob",
               "ErrorCode": "BlobWriteError",
-              "ErrorMessage": "Failed to compress or write the daily report.",
+              "ErrorMessage": "Failed to convert to Parquet or write the daily report.",
               "Severity": "High",
-              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.zip"
+              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.parquet"
             }
           ],
           "authentication": {

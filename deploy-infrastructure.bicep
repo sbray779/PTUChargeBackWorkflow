@@ -12,6 +12,9 @@ param sourceLogAnalyticsWorkspace string
 @description('The resource group containing the source Log Analytics workspace')
 param sourceWorkspaceResourceGroup string
 
+@description('Tags to apply to all deployed resources')
+param tags object = {}
+
 // Generate unique suffix for all resource names
 var uniqueSuffix = uniqueString(resourceGroup().id)
 var logicAppName = 'logic-chargeback-${uniqueSuffix}'
@@ -25,24 +28,27 @@ var userManagedIdentityName = 'id-chargeback-${uniqueSuffix}'
 var zipFunctionAppName = 'func-zipcsv-${uniqueSuffix}'
 var zipFunctionStorageAccountName = 'fnzip${uniqueSuffix}'
 var zipFunctionPlanName = 'asp-zipcsv-${uniqueSuffix}'
+var appInsightsName = 'appi-chargeback-${uniqueSuffix}'
 
 // User Assigned Managed Identity
 resource userManagedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: userManagedIdentityName
   location: location
+  tags: tags
 }
 
 // App Service Plan for Logic App
 resource appServicePlan 'Microsoft.Web/serverfarms@2022-09-01' = {
   name: appServicePlanName
   location: location
+  tags: tags
   sku: {
     name: 'WS1'
     tier: 'WorkflowStandard'
   }
   kind: 'elastic'
   properties: {
-    maximumElasticWorkerCount: 20
+    maximumElasticWorkerCount: 5
   }
 }
 
@@ -50,6 +56,7 @@ resource appServicePlan 'Microsoft.Web/serverfarms@2022-09-01' = {
 resource logicAppStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: logicAppStorageAccountName
   location: location
+  tags: tags
   sku: {
     name: 'Standard_LRS'
   }
@@ -74,6 +81,7 @@ resource fileShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-0
 resource reportStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: reportStorageAccountName
   location: location
+  tags: tags
   sku: {
     name: 'Standard_LRS'
   }
@@ -94,12 +102,46 @@ resource reportContainer 'Microsoft.Storage/storageAccounts/blobServices/contain
   }
 }
 
+// Lifecycle policy: tier old reports to Cool after 90 days, delete after 365 days
+resource reportStorageLifecycle 'Microsoft.Storage/storageAccounts/managementPolicies@2023-01-01' = {
+  name: 'default'
+  parent: reportStorage
+  properties: {
+    policy: {
+      rules: [
+        {
+          name: 'tier-and-expire-reports'
+          enabled: true
+          type: 'Lifecycle'
+          definition: {
+            filters: {
+              blobTypes: [ 'blockBlob' ]
+              prefixMatch: [ 'reportoutput/' ]
+            }
+            actions: {
+              baseBlob: {
+                tierToCool: {
+                  daysAfterModificationGreaterThan: 90
+                }
+                delete: {
+                  daysAfterModificationGreaterThan: 365
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
+
 // Logic App with user-assigned managed identity
 // dependsOn fileShare is explicit because logicApp does not reference it directly,
 // but ARM must not deploy the Logic App before the WEBSITE_CONTENTSHARE file share exists.
 resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
   name: logicAppName
   location: location
+  tags: tags
   kind: 'functionapp,workflowapp'
   dependsOn: [fileShare]
   identity: {
@@ -182,7 +224,7 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
           value: errorWorkspace.properties.customerId
         }
       ]
-      netFrameworkVersion: 'v6.0'
+      netFrameworkVersion: 'v8.0'
       use32BitWorkerProcess: false
     }
   }
@@ -192,6 +234,7 @@ resource logicApp 'Microsoft.Web/sites@2022-09-01' = {
 resource errorWorkspace 'Microsoft.OperationalInsights/workspaces@2022-10-01' = {
   name: errorWorkspaceName
   location: location
+  tags: tags
   properties: {
     sku: {
       name: 'PerGB2018'
@@ -264,6 +307,7 @@ resource chargeBackChunksTable 'Microsoft.OperationalInsights/workspaces/tables@
 resource waitForCustomTables 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
   name: 'wait-tables-${uniqueSuffix}'
   location: location
+  tags: tags
   kind: 'AzurePowerShell'
   identity: {
     type: 'UserAssigned'
@@ -287,6 +331,7 @@ resource waitForCustomTables 'Microsoft.Resources/deploymentScripts@2023-08-01' 
 resource dce 'Microsoft.Insights/dataCollectionEndpoints@2022-06-01' = {
   name: dceEndpointName
   location: location
+  tags: tags
   properties: {
     networkAcls: {
       publicNetworkAccess: 'Enabled'
@@ -298,6 +343,7 @@ resource dce 'Microsoft.Insights/dataCollectionEndpoints@2022-06-01' = {
 resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
   name: dcrName
   location: location
+  tags: tags
   properties: {
     dataCollectionEndpointId: dce.id
     streamDeclarations: {
@@ -429,6 +475,7 @@ module sourceWorkspaceRbac 'modules/logAnalyticsRbac.bicep' = {
 resource zipFunctionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: zipFunctionStorageAccountName
   location: location
+  tags: tags
   sku: {
     name: 'Standard_LRS'
   }
@@ -445,6 +492,7 @@ resource zipFunctionStorage 'Microsoft.Storage/storageAccounts@2023-01-01' = {
 resource zipFunctionPlan 'Microsoft.Web/serverfarms@2022-09-01' = {
   name: zipFunctionPlanName
   location: location
+  tags: tags
   sku: {
     name: 'Y1'
     tier: 'Dynamic'
@@ -452,10 +500,23 @@ resource zipFunctionPlan 'Microsoft.Web/serverfarms@2022-09-01' = {
   kind: 'functionapp'
 }
 
-// Zip CSV Function App (.NET 8 isolated)
+// Application Insights (workspace-based) for Zip CSV Function App telemetry
+resource appInsights 'Microsoft.Insights/components@2020-02-02' = {
+  name: appInsightsName
+  location: location
+  tags: tags
+  kind: 'web'
+  properties: {
+    Application_Type: 'web'
+    WorkspaceResourceId: errorWorkspace.id
+  }
+}
+
+// Zip CSV Function App (.NET 10 isolated)
 resource zipFunctionApp 'Microsoft.Web/sites@2022-09-01' = {
   name: zipFunctionAppName
   location: location
+  tags: tags
   kind: 'functionapp'
   identity: {
     type: 'SystemAssigned'
@@ -485,6 +546,14 @@ resource zipFunctionApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'FUNCTIONS_WORKER_RUNTIME'
           value: 'dotnet-isolated'
         }
+        {
+          name: 'APPLICATIONINSIGHTS_CONNECTION_STRING'
+          value: appInsights.properties.ConnectionString
+        }
+        {
+          name: 'ApplicationInsightsAgent_EXTENSION_VERSION'
+          value: '~3'
+        }
       ]
       netFrameworkVersion: 'v10.0'
     }
@@ -507,4 +576,6 @@ output sourceWorkspaceName string = sourceLogAnalyticsWorkspace
 output sourceWorkspaceResourceGroup string = sourceWorkspaceResourceGroup
 output sourceWorkspaceId string = sourceWorkspaceRbac.outputs.workspaceCustomerId
 output zipFunctionAppName string = zipFunctionApp.name
+output appInsightsName string = appInsights.name
+output appInsightsConnectionString string = appInsights.properties.ConnectionString
 

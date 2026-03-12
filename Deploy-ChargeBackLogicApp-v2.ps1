@@ -370,20 +370,6 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "  ⚠ Website Contributor assignment may already exist" -ForegroundColor Yellow
 }
 
-# Log Analytics Reader on source workspace
-Write-Host "  Assigning Log Analytics Reader on source workspace..." -ForegroundColor Gray
-az role assignment create `
-    --assignee $userManagedIdentityPrincipalId `
-    --role "Log Analytics Reader" `
-    --scope "/subscriptions/$subscription/resourceGroups/$SourceWorkspaceResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$SourceLogAnalyticsWorkspace" `
-    --output none 2>$null
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ Log Analytics Reader assigned on source workspace" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠ Log Analytics Reader assignment may already exist" -ForegroundColor Yellow
-}
-
 # Reader on source workspace for resource metadata access
 Write-Host "  Assigning Reader on source workspace resource..." -ForegroundColor Gray
 az role assignment create `
@@ -639,12 +625,12 @@ Write-Host ""
 Write-Host "RBAC Assignments:" -ForegroundColor Cyan
 Write-Host "  ✓ Website Contributor on Logic App (for dynamic schema)" -ForegroundColor White
 Write-Host "  ✓ Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
-Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
+Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Storage Blob Data Contributor on $reportStorageAccountName (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Monitoring Metrics Publisher on DCR/DCE (via Bicep)" -ForegroundColor White
 Write-Host ""
 Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Verify workflow in Azure Portal: https://portal.azure.com/#resource/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$LogicAppName" -ForegroundColor White
-Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/ (*.zip files)" -ForegroundColor White
+Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/ (*.parquet files)" -ForegroundColor White
 Write-Host "  3. Monitor errors in workspace: $errorWorkspaceName (table: WorkflowFailures_CL)" -ForegroundColor White
 Write-Host ""
