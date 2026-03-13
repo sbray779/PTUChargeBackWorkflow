@@ -256,6 +256,31 @@ resource chargeBackChunksTable 'Microsoft.OperationalInsights/workspaces/tables@
   }
 }
 
+// Wait for custom table schemas to propagate before creating the DCR.
+// Azure reports tables as created before they are queryable by DCR validation,
+// causing InvalidOutputTable errors if the DCR is created immediately.
+resource waitForCustomTables 'Microsoft.Resources/deploymentScripts@2023-08-01' = {
+  name: 'wait-tables-${uniqueSuffix}'
+  location: location
+  kind: 'AzurePowerShell'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${userManagedIdentity.id}': {}
+    }
+  }
+  properties: {
+    azPowerShellVersion: '11.0'
+    scriptContent: 'Start-Sleep -Seconds 90'
+    retentionInterval: 'PT1H'
+    cleanupPreference: 'OnSuccess'
+  }
+  dependsOn: [
+    customTable
+    chargeBackChunksTable
+  ]
+}
+
 // Data Collection Endpoint
 resource dce 'Microsoft.Insights/dataCollectionEndpoints@2022-06-01' = {
   name: dceEndpointName
@@ -340,8 +365,7 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2022-06-01' = {
     ]
   }
   dependsOn: [
-    customTable
-    chargeBackChunksTable
+    waitForCustomTables
   ]
 }
 

@@ -95,7 +95,23 @@ if ($rgExists -eq "true") {
     Write-Host "✓ Resource Group created: $ResourceGroupName" -ForegroundColor Green
 }
 
-Write-Host "`nStep 2: Deploying infrastructure using Bicep..." -ForegroundColor Cyan
+Write-Host "`nStep 2: Cleaning up orphaned role assignments..." -ForegroundColor Cyan
+Write-Host "  Removing any role assignments whose principal no longer exists (prevents RoleAssignmentUpdateNotPermitted)" -ForegroundColor Gray
+$orphaned = az role assignment list --resource-group $ResourceGroupName --query "[?principalName==''].id" -o tsv 2>$null
+if ($orphaned) {
+    foreach ($id in $orphaned -split "`n") {
+        $id = $id.Trim()
+        if ($id) {
+            az role assignment delete --ids $id --output none 2>$null
+            Write-Host "  Deleted orphaned assignment: $id" -ForegroundColor Yellow
+        }
+    }
+    Write-Host "✓ Orphaned role assignments cleaned up" -ForegroundColor Green
+} else {
+    Write-Host "  No orphaned role assignments found" -ForegroundColor Gray
+}
+
+Write-Host "`nStep 3: Deploying infrastructure using Bicep..." -ForegroundColor Cyan
 Write-Host "  This will create: App Service Plan, Logic App (with managed identity), Storage, Log Analytics, DCR/DCE, RBAC" -ForegroundColor Gray
 
 $deploymentName = "chargebackInfra-$(Get-Date -Format 'yyyyMMddHHmmss')"
@@ -371,44 +387,7 @@ Write-Host "✓ RBAC roles assigned" -ForegroundColor Green
 Write-Host "  Waiting 30 seconds for RBAC permissions to propagate..." -ForegroundColor Gray
 Start-Sleep -Seconds 30
 
-Write-Host "`nStep 6: Updating workflow and connections with deployment-specific values..." -ForegroundColor Cyan
-
-# Read workflow template
-$workflowPath = Join-Path $PSScriptRoot "CreateChargeBackReport\workflow.json"
-$workflowContent = Get-Content $workflowPath -Raw
-
-# Replace placeholders in workflow
-$workflowContent = $workflowContent `
-    -replace '{{SUBSCRIPTION_ID}}', $subscription `
-    -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
-    -replace '{{SOURCE_WORKSPACE}}', $SourceLogAnalyticsWorkspace `
-    -replace '{{SOURCE_WORKSPACE_RG}}', $SourceWorkspaceResourceGroup `
-    -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
-    -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
-    -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
-    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId
-
-$workflowContent | Set-Content $workflowPath -Encoding UTF8
-
-# Read and update connections.json template
-$connectionsPath = Join-Path $PSScriptRoot "connections.json"
-$connectionsContent = Get-Content $connectionsPath -Raw
-
-# Replace placeholders in connections
-$connectionsContent = $connectionsContent `
-    -replace '{{SUBSCRIPTION_ID}}', $subscription `
-    -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
-    -replace '{{LOCATION}}', $Location.ToLower() `
-    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
-    -replace '{{AZURE_MONITOR_LOGS_RUNTIME_URL}}', $azureMonitorLogsRuntimeUrl `
-    -replace '{{AZURE_BLOB_RUNTIME_URL}}', $azureBlobRuntimeUrl
-
-$connectionsContent | Set-Content $connectionsPath -Encoding UTF8
-
-Write-Host "✓ Workflow and connections updated" -ForegroundColor Green
-
-Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
-Set-Location $PSScriptRoot
+Write-Host "`nStep 6: Staging workflow and connections for deployment..." -ForegroundColor Cyan
 
 # Check if Azure Functions Core Tools is installed
 $funcVersion = func --version 2>&1
@@ -420,33 +399,73 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Using Azure Functions Core Tools version: $funcVersion" -ForegroundColor Gray
 
-# Generate local.settings.json required by func CLI to identify the project runtime.
-# Logic App Standard on dotnet runtime requires this to be present for func publish.
-$localSettingsPath = Join-Path $PSScriptRoot "local.settings.json"
-$localSettings = @{
-    IsEncrypted = $false
-    Values      = @{
-        FUNCTIONS_WORKER_RUNTIME = "dotnet"
-        AzureWebJobsStorage      = ""
+# Stage all Logic App files into a temp directory so placeholder tokens are never
+# written back to the source files. The source files always stay as templates.
+$tempDeployDir = Join-Path $env:TEMP "chargeback-deploy-$(Get-Date -Format 'yyyyMMddHHmmss')"
+New-Item -ItemType Directory -Path $tempDeployDir | Out-Null
+Write-Host "  Staging files to: $tempDeployDir" -ForegroundColor Gray
+
+$deploySucceeded = $false
+try {
+    # host.json needs no substitution
+    Copy-Item (Join-Path $PSScriptRoot "host.json") $tempDeployDir
+
+    # connections.json - resolve placeholders into the staged copy
+    $connectionsContent = Get-Content (Join-Path $PSScriptRoot "connections.json") -Raw
+    $connectionsContent = $connectionsContent `
+        -replace '{{SUBSCRIPTION_ID}}', $subscription `
+        -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
+        -replace '{{LOCATION}}', $Location.ToLower() `
+        -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
+        -replace '{{AZURE_MONITOR_LOGS_RUNTIME_URL}}', $azureMonitorLogsRuntimeUrl `
+        -replace '{{AZURE_BLOB_RUNTIME_URL}}', $azureBlobRuntimeUrl
+    $connectionsContent | Set-Content (Join-Path $tempDeployDir "connections.json") -Encoding UTF8
+
+    # Each workflow subfolder - resolve placeholders into staged copies
+    Get-ChildItem -Path $PSScriptRoot -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName "workflow.json") } |
+        ForEach-Object {
+            $destDir = Join-Path $tempDeployDir $_.Name
+            New-Item -ItemType Directory -Path $destDir | Out-Null
+            $workflowContent = Get-Content (Join-Path $_.FullName "workflow.json") -Raw
+            $workflowContent = $workflowContent `
+                -replace '{{SUBSCRIPTION_ID}}', $subscription `
+                -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
+                -replace '{{SOURCE_WORKSPACE}}', $SourceLogAnalyticsWorkspace `
+                -replace '{{SOURCE_WORKSPACE_RG}}', $SourceWorkspaceResourceGroup `
+                -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
+                -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
+                -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
+                -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId
+            $workflowContent | Set-Content (Join-Path $destDir "workflow.json") -Encoding UTF8
+        }
+
+    # local.settings.json is required by func CLI but should never be committed
+    @{
+        IsEncrypted = $false
+        Values      = @{
+            FUNCTIONS_WORKER_RUNTIME = "dotnet"
+            AzureWebJobsStorage      = ""
+        }
+    } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $tempDeployDir "local.settings.json") -Encoding UTF8
+
+    Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
+    Set-Location $tempDeployDir
+    Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
+    $publishOutput = func azure functionapp publish $LogicAppName 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
+        Write-Host "Output: $publishOutput" -ForegroundColor Yellow
+    } else {
+        $deploySucceeded = $true
+        Write-Host "✓ Workflow deployed" -ForegroundColor Green
     }
+} finally {
+    Set-Location $PSScriptRoot
+    Remove-Item $tempDeployDir -Recurse -Force -ErrorAction SilentlyContinue
 }
-$localSettings | ConvertTo-Json -Depth 5 | Set-Content $localSettingsPath -Encoding UTF8
-Write-Host "  Generated local.settings.json for func CLI" -ForegroundColor Gray
-
-# Deploy workflow - capture output to show errors
-Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
-$publishOutput = func azure functionapp publish $LogicAppName 2>&1
-
-# Clean up the generated local.settings.json regardless of outcome
-Remove-Item $localSettingsPath -ErrorAction SilentlyContinue
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
-    Write-Host "Output: $publishOutput" -ForegroundColor Yellow
-    exit 1
-}
-
-Write-Host "✓ Workflow deployed" -ForegroundColor Green
+if (-not $deploySucceeded) { exit 1 }
 
 Write-Host "`nStep 8: Restarting Logic App to apply permissions..." -ForegroundColor Cyan
 Write-Host "  This ensures all RBAC permissions and identity tokens are refreshed" -ForegroundColor Gray
