@@ -30,28 +30,30 @@ Instead of running a single 24-hour query, it splits the time range into **12 x 
 ### Phase 1 — Chunk Queries (Per-Chunk Loop)
 
 1. **Initialize_Time_Chunks** — Creates an array of 12 time chunks (2 hours each)
-2. **Initialize_Report_Date** / **Initialize_Workflow_Run_Id** / **Initialize_Expected_Chunk_Count** — Set up run-scoped variables
+2. **Initialize_Report_Date** / **Initialize_Workflow_Run_Id** / **Initialize_Expected_Chunk_Count** / **Initialize_Chunk_Batch_Offset** / **Initialize_Batch_Write_Failed** — Set up run-scoped variables
 3. **Process_Time_Chunks** (ForEach loop, sequential) — For each chunk:
-   - **Submit_Chunk_Query** — Sends KQL query against the source APIM workspace with `Prefer: wait=0`
+   - **Submit_Chunk_Query** — Sends KQL query against the source APIM workspace with `Prefer: wait=60` (allows synchronous return for queries completing under 60s, avoiding unnecessary async polling)
    - **Check_Chunk_Sync_Or_Async** — Branches on HTTP 200 (sync) vs 202 (async; polls until complete)
    - **Get_Chunk_Results** — Selects final results from whichever path completed
    - **Transform_Chunk_To_Objects** — Converts columnar query results to named objects
    - **Enrich_Chunk_Rows** — Adds `ReportDate`, `WorkflowRunId`, and `ChunkId` to every row
    - **Write_Chunk_To_Logs_If_Has_Rows** (If condition):
-     - **true**: `Write_Chunk_To_Logs` (HTTP POST to Logs Ingestion API → `ChargeBackChunks_CL`) + `Increment_Expected_Chunk_Count`
+     - **true**: `Reset_Batch_Offset` → `Post_Chunk_Batches` (Until loop, 500 rows per POST to stay under the Logs Ingestion API 1MB limit) → `Increment_Expected_Chunk_Count`
+     - If any batch POST fails after all retries, `Set_Batch_Write_Failed` flags the failure and `Advance_Batch_Offset` still advances to prevent the loop from hanging
      - **false**: no-op (skips empty chunks to avoid 400 errors)
+4. **Fail_If_Batch_Write_Failed** — If any batch POST failed during `Process_Time_Chunks`, terminates the workflow with a `BatchWriteFailed` error to prevent an incomplete report from being treated as complete
 
 ### Phase 2 — Ingestion Polling
 
-4. **Wait_Before_Ingestion_Poll** — 30-second initial pause
-5. **Poll_For_Ingestion** (Until loop) — Polls `ChargeBackChunks_CL` every 30 seconds until `dcount(ChunkId) >= ExpectedChunkCount` (i.e., all written chunks are queryable). Times out after 20 minutes and continues regardless.
+5. **Wait_Before_Ingestion_Poll** — 30-second initial pause
+6. **Poll_For_Ingestion** (Until loop) — Polls `ChargeBackChunks_CL` every 30 seconds until `dcount(ChunkId) >= ExpectedChunkCount` (i.e., all written chunks are queryable). Times out after 20 minutes and continues regardless.
 
 ### Phase 3 — Daily Aggregation
 
-6. **Submit_Daily_Query** — Queries `ChargeBackChunks_CL` (error workspace), filtered by `WorkflowRunId` and `ReportDate`, to re-aggregate all 12 chunks into a single daily summary
-7. **Check_Daily_Sync_Or_Async** — Async polling pattern (same as chunk queries)
-8. **Get_Daily_Results** → **Transform_Daily_To_Objects** → **Create_Daily_CSV**
-9. **Write_Daily_Report_Blob** — Writes one CSV to blob storage with a date-time-stamped filename: `chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
+7. **Submit_Daily_Query** — Queries `ChargeBackChunks_CL` (error workspace), filtered by `WorkflowRunId` and `ReportDate`, to re-aggregate all 12 chunks into a single daily summary (uses `Prefer: wait=60`)
+8. **Check_Daily_Sync_Or_Async** — Async polling pattern (same as chunk queries)
+9. **Get_Daily_Results** → **Transform_Daily_To_Objects** → **Create_Daily_CSV**
+10. **Write_Daily_Report_Blob** — Writes one CSV to blob storage with a date-time-stamped filename: `chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
 
 **Output** — One CSV file per run:
 - `reportoutput/chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
@@ -70,6 +72,13 @@ Log Analytics queries have a 5GB memory limit for joins. With high-volume APIM t
 - All chunks are re-aggregated in a single final KQL query — no fan-out merge required in the Logic App
 - `WorkflowRunId` tagging enables idempotent re-runs: re-running on the same day produces a new timestamped file without corrupting previous runs
 - The Logs Ingestion API ingestion step is fault-tolerant: if ingestion is slow, the poll loop waits up to 20 minutes before proceeding
+
+### Fault Tolerance
+
+- **500-row batching** — Each chunk's enriched rows are sent to the Logs Ingestion API in batches of 500 rows via a `Post_Chunk_Batches` Until loop. This prevents HTTP 430 `ContentLengthLimitExceeded` errors (1 MB per-request API limit).
+- **BatchWriteFailed safety** — If any batch POST fails after all retries, a `BatchWriteFailed` flag is set and the batch offset still advances (preventing the loop from hanging at PT15M timeout). After all chunks complete, `Fail_If_Batch_Write_Failed` terminates the workflow with a descriptive error rather than producing an incomplete report.
+- **Orphaned RBAC cleanup** — The deploy script removes role assignments with no valid principal before running Bicep, preventing `RoleAssignmentUpdateNotPermitted` errors when identity resources are recreated.
+- **Temp-directory staging** — Placeholder substitution happens in a temp directory; source files (`workflow.json`, `connections.json`) are never modified by the deploy script.
 
 This approach is a pure Logic App solution with no external dependencies on Azure Functions or JavaScript code actions, ensuring compatibility with .NET-based Logic App Standard runtimes
 
@@ -112,18 +121,19 @@ param sourceWorkspaceResourceGroup = '<your-source-workspace-resource-group>'
 .\Deploy-ChargeBackLogicApp-v2.ps1
 ```
 
-The script executes 8 steps automatically:
+The script executes 9 steps automatically:
 
 | Step | Action |
 |------|--------|
 | 1 | Create or verify resource group |
-| 2 | Deploy infrastructure via Bicep (Logic App, storage, identity, DCR/DCE, RBAC) |
-| 3 | Create API connections (Azure Monitor Logs + Azure Blob) with managed identity access policies |
-| 4 | Retrieve connection runtime URLs |
-| 5 | Assign RBAC roles (Website Contributor, Log Analytics Reader, Reader on source workspace) |
-| 6 | Substitute `{{placeholders}}` in `workflow.json` and `connections.json` with deployment values |
-| 7 | Deploy workflow to Logic App via `func azure functionapp publish` |
-| 8 | Restart Logic App to apply permissions |
+| 2 | Clean up orphaned role assignments (prevents `RoleAssignmentUpdateNotPermitted` errors when identity is recreated) |
+| 3 | Deploy infrastructure via Bicep (Logic App, storage, identity, DCR/DCE, RBAC) |
+| 4 | Create API connections (Azure Monitor Logs + Azure Blob) with managed identity access policies |
+| 5 | Retrieve connection runtime URLs |
+| 6 | Assign RBAC roles (Website Contributor, Log Analytics Reader, Reader on source workspace) |
+| 7 | Stage `workflow.json` and `connections.json` into a temp directory, substitute `{{placeholders}}` with deployment values (source files are never modified) |
+| 8 | Deploy workflow to Logic App via `func azure functionapp publish` from the staged temp directory |
+| 9 | Restart Logic App to apply permissions |
 
 ### Step 3: Verify
 
@@ -162,8 +172,10 @@ The `workflow.json` and `connections.json` files contain `{{placeholder}}` token
 | `{{USER_MANAGED_IDENTITY_ID}}` | Full resource ID of the user-assigned managed identity | `az identity show --name <name> --resource-group <rg> --query id -o tsv` |
 | `{{DCE_ENDPOINT}}` | Data Collection Endpoint ingestion URL | `az monitor data-collection endpoint show --name <name> --resource-group <rg> --query logsIngestion.endpoint -o tsv` |
 | `{{DCR_IMMUTABLE_ID}}` | Data Collection Rule immutable ID | `az monitor data-collection rule show --name <name> --resource-group <rg> --query immutableId -o tsv` |
-| `{{AZURE_MONITOR_LOGS_RUNTIME_URL}}` | Azure Monitor Logs API connection runtime URL | Azure Portal → API Connections → azuremonitorlogs → Properties |
-| `{{AZURE_BLOB_RUNTIME_URL}}` | Azure Blob API connection runtime URL | Azure Portal → API Connections → azureblob → Properties |
+| `{{AZURE_MONITOR_LOGS_RUNTIME_URL}}` | Azure Monitor Logs API connection runtime URL (in `connections.json`) | Azure Portal → API Connections → azuremonitorlogs → Properties |
+| `{{AZURE_BLOB_RUNTIME_URL}}` | Azure Blob API connection runtime URL (in `connections.json`) | Azure Portal → API Connections → azureblob → Properties |
+
+> **Note:** The full deployment script (`Deploy-ChargeBackLogicApp-v2.ps1`) handles all placeholder substitution automatically using a temp-directory staging approach — source files are never overwritten. Manual replacement is only needed for workflow-only deployments.
 
 Replace placeholders using PowerShell:
 
@@ -265,16 +277,17 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 │  │  │   │                                                           │  │   │
 │  │  │   ▼                                                           │  │   │
 │  │  │ ┌─ Process_Time_Chunks (ForEach, sequential) ──────────────┐  │  │   │
-│  │  │ │  Submit_Chunk_Query (Prefer: wait=0)                     │  │  │   │
+│  │  │ │  Submit_Chunk_Query (Prefer: wait=60)                    │  │  │   │
 │  │  │ │    │ 200 (sync) / 202 (async → Poll_Chunk_Results)       │  │  │   │
 │  │  │ │  Get_Chunk_Results → Transform_Chunk_To_Objects          │  │  │   │
 │  │  │ │  Enrich_Chunk_Rows (adds ReportDate/WorkflowRunId/Chunk) │  │  │   │
 │  │  │ │  Write_Chunk_To_Logs_If_Has_Rows                         │  │  │   │
-│  │  │ │    ├─[has rows]─▶ Write_Chunk_To_Logs (DCE/DCR)          │  │  │   │
+│  │  │ │    ├─[has rows]─▶ Post_Chunk_Batches (500 rows/batch)    │  │  │   │
 │  │  │ │    │               + Increment_Expected_Chunk_Count      │  │  │   │
 │  │  │ │    └─[empty]────▶ (no-op)                                │  │  │   │
 │  │  │ └─────────────────────────────────────────────────────────┘  │  │   │
 │  │  │   │                                                           │  │   │
+│  │  │   ▼ Fail_If_Batch_Write_Failed (terminates if any POST failed)│  │   │
 │  │  │   ▼ Wait_Before_Ingestion_Poll (30s)                          │  │   │
 │  │  │   ▼ Poll_For_Ingestion (Until dcount(ChunkId)>=Expected,      │  │   │
 │  │  │                         30s interval, 20min timeout)          │  │   │
