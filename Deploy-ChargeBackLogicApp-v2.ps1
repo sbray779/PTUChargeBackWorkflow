@@ -23,14 +23,29 @@
 .PARAMETER LogicAppName
     The name of the Logic App to create. Default: Logic-App-ChargeBack-Report
 
+.PARAMETER ZipFunctionAppRegistrationClientId
+    (Optional) The Application (client) ID of a pre-existing Entra ID app registration to use for
+    authenticating the Zip CSV Function App.  Required when the deployer does not have permissions
+    to create app registrations in Entra ID.  See README.md for manual creation steps.
+
 .EXAMPLE
-    .\Deploy-ChargeBackLogicApp-v2.ps1 -SourceLogAnalyticsWorkspace "MyLLMLogsWorkspace" -Location "eastus2"
+    # Standard deployment — script creates the app registration automatically
+    .\Deploy-ChargeBackLogicApp-v2.ps1
+
+.EXAMPLE
+    # Deployment when the app registration was pre-created by an admin
+    .\Deploy-ChargeBackLogicApp-v2.ps1 -ZipFunctionAppRegistrationClientId "<appId from admin>"
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
-    [string]$ParametersFile = "deploy-infrastructure.bicepparam"
+    [string]$ParametersFile = "deploy-infrastructure.bicepparam",
+
+    # Supply this when the deployer lacks permission to create Entra app registrations.
+    # An admin must first run the manual steps documented in README.md and provide the resulting appId.
+    [Parameter(Mandatory=$false)]
+    [string]$ZipFunctionAppRegistrationClientId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +94,21 @@ if (-not $ResourceGroupName -or -not $Location -or -not $SourceLogAnalyticsWorks
     Write-Host "ERROR: Failed to parse required parameters from Bicep parameters file" -ForegroundColor Red
     exit 1
 }
+
+# Verify .NET 10 SDK is available (required to build ZipCsvFunction)
+$dotnetVersion = dotnet --version 2>&1
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: .NET SDK is not installed or not in PATH" -ForegroundColor Red
+    Write-Host "Install .NET 10 SDK from: https://aka.ms/dotnet/download" -ForegroundColor Yellow
+    exit 1
+}
+$majorVersion = [int]($dotnetVersion -split '\.')[0]
+if ($majorVersion -lt 10) {
+    Write-Host "ERROR: .NET 10 SDK or later is required (found: $dotnetVersion)" -ForegroundColor Red
+    Write-Host "Install .NET 10 SDK from: https://aka.ms/dotnet/download" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "  .NET SDK version: $dotnetVersion" -ForegroundColor Gray
 
 Write-Host "  Resource Group: $ResourceGroupName" -ForegroundColor Gray
 Write-Host "  Location: $Location" -ForegroundColor Gray
@@ -142,6 +172,7 @@ $reportStorageAccountName = $deploymentOutput.properties.outputs.reportStorageAc
 $dceEndpoint = $deploymentOutput.properties.outputs.dceEndpoint.value
 $dcrImmutableId = $deploymentOutput.properties.outputs.dcrImmutableId.value
 $errorWorkspaceName = $deploymentOutput.properties.outputs.errorWorkspaceName.value
+$zipFunctionAppName = $deploymentOutput.properties.outputs.zipFunctionAppName.value
 
 Write-Host "✓ Infrastructure deployed successfully" -ForegroundColor Green
 Write-Host "  Logic App: $LogicAppName" -ForegroundColor Gray
@@ -151,7 +182,7 @@ Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor G
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor Gray
 Write-Host "  DCE Endpoint: $dceEndpoint" -ForegroundColor Gray
 Write-Host "  DCR Immutable ID: $dcrImmutableId" -ForegroundColor Gray
-
+  Write-Host "  Zip Function App: $zipFunctionAppName" -ForegroundColor Gray
 Write-Host "`nStep 3: Creating API Connections..." -ForegroundColor Cyan
 
 # Get tenant ID for access policies
@@ -339,20 +370,6 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "  ⚠ Website Contributor assignment may already exist" -ForegroundColor Yellow
 }
 
-# Log Analytics Reader on source workspace
-Write-Host "  Assigning Log Analytics Reader on source workspace..." -ForegroundColor Gray
-az role assignment create `
-    --assignee $userManagedIdentityPrincipalId `
-    --role "Log Analytics Reader" `
-    --scope "/subscriptions/$subscription/resourceGroups/$SourceWorkspaceResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$SourceLogAnalyticsWorkspace" `
-    --output none 2>$null
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ Log Analytics Reader assigned on source workspace" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠ Log Analytics Reader assignment may already exist" -ForegroundColor Yellow
-}
-
 # Reader on source workspace for resource metadata access
 Write-Host "  Assigning Reader on source workspace resource..." -ForegroundColor Gray
 az role assignment create `
@@ -371,41 +388,140 @@ Write-Host "✓ RBAC roles assigned" -ForegroundColor Green
 Write-Host "  Waiting 30 seconds for RBAC permissions to propagate..." -ForegroundColor Gray
 Start-Sleep -Seconds 30
 
-Write-Host "`nStep 6: Updating workflow and connections with deployment-specific values..." -ForegroundColor Cyan
+Write-Host "`nStep 6: Building and deploying Zip CSV Function App..." -ForegroundColor Cyan
 
-# Read workflow template
-$workflowPath = Join-Path $PSScriptRoot "CreateChargeBackReport\workflow.json"
-$workflowContent = Get-Content $workflowPath -Raw
+# Build the .NET 8 isolated function
+Write-Host "  Building ZipCsvFunction..." -ForegroundColor Gray
+$zipCsvProjectPath = Join-Path $PSScriptRoot "ZipCsvFunction\ZipCsvFunction.csproj"
+$zipCsvPublishPath = Join-Path $PSScriptRoot "ZipCsvFunction\publish"
+dotnet publish $zipCsvProjectPath -c Release -o $zipCsvPublishPath --nologo
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: dotnet publish failed for ZipCsvFunction" -ForegroundColor Red
+    exit 1
+}
 
-# Replace placeholders in workflow
-$workflowContent = $workflowContent `
-    -replace '{{SUBSCRIPTION_ID}}', $subscription `
-    -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
-    -replace '{{SOURCE_WORKSPACE}}', $SourceLogAnalyticsWorkspace `
-    -replace '{{SOURCE_WORKSPACE_RG}}', $SourceWorkspaceResourceGroup `
-    -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
-    -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
-    -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
-    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId
+# Package and deploy via zip
+$zipPackagePath = Join-Path $env:TEMP "ZipCsvFunction.zip"
+Compress-Archive -Path (Join-Path $zipCsvPublishPath "*") -DestinationPath $zipPackagePath -Force
+Write-Host "  Deploying to Function App: $zipFunctionAppName..." -ForegroundColor Gray
+# Use 'az functionapp deploy' (newer /api/publish endpoint) instead of config-zip to avoid
+# the legacy Kudu Ninject DI crash that occurs with the old /api/zipdeploy endpoint.
+az functionapp deploy `
+    --name $zipFunctionAppName `
+    --resource-group $ResourceGroupName `
+    --src-path $zipPackagePath `
+    --type zip `
+    --output none
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Zip CSV Function App deployment failed" -ForegroundColor Red
+    exit 1
+}
 
-$workflowContent | Set-Content $workflowPath -Encoding UTF8
+Write-Host "`nStep 6b: Configuring Entra ID authentication on Zip CSV Function App..." -ForegroundColor Cyan
+# EasyAuth requires a real AAD app registration as the resource audience.
+# The function app name is only known after Bicep runs, so this cannot be done in Bicep.
+$funcAuthAppName = "$zipFunctionAppName-auth"
+# Identifier URI must include the tenant ID to satisfy org policies that require
+# a verified domain, tenant ID, or app ID in the URI (see aka.ms/identifier-uri-formatting-error).
+$funcAudience    = "api://$tenantId/$zipFunctionAppName"
 
-# Read and update connections.json template
-$connectionsPath = Join-Path $PSScriptRoot "connections.json"
-$connectionsContent = Get-Content $connectionsPath -Raw
+if ($ZipFunctionAppRegistrationClientId) {
+    # App registration was pre-created by an admin — use the supplied clientId directly.
+    $funcAppClientId = $ZipFunctionAppRegistrationClientId
+    Write-Host "  Using pre-supplied app registration: $funcAppClientId" -ForegroundColor Gray
+    # Ensure the identifier URI is set (idempotent — safe to run on existing registrations).
+    az ad app update --id $funcAppClientId --identifier-uris $funcAudience 2>&1 | Out-Null
+} else {
+    # Attempt to find an existing registration or create a new one.
+    $existingApp = az ad app list --display-name $funcAuthAppName --query "[0]" -o json 2>$null | ConvertFrom-Json
+    if ($existingApp -and $existingApp.appId) {
+        $funcAppClientId = $existingApp.appId
+        Write-Host "  Using existing app registration: $funcAppClientId" -ForegroundColor Gray
+        az ad app update --id $funcAppClientId --identifier-uris $funcAudience 2>&1 | Out-Null
+    } else {
+        Write-Host "  Creating app registration for Function App..." -ForegroundColor Gray
+        $funcAppClientId = az ad app create `
+            --display-name $funcAuthAppName `
+            --identifier-uris $funcAudience `
+            --query appId -o tsv 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "" -ForegroundColor Red
+            Write-Host "ERROR: Failed to create Entra ID app registration." -ForegroundColor Red
+            Write-Host "  This usually means your account does not have permission to create" -ForegroundColor Yellow
+            Write-Host "  app registrations in this tenant." -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "  Ask a tenant administrator to run the following commands and provide" -ForegroundColor Yellow
+            Write-Host "  you with the resulting Application (client) ID:" -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "    az ad app create ``" -ForegroundColor White
+            Write-Host "      --display-name '$funcAuthAppName' ``" -ForegroundColor White
+            Write-Host "      --identifier-uris '$funcAudience' ``" -ForegroundColor White
+            Write-Host "      --query appId -o tsv" -ForegroundColor White
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "  Then re-run this script with the -ZipFunctionAppRegistrationClientId parameter:" -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "    .\Deploy-ChargeBackLogicApp-v2.ps1 -ZipFunctionAppRegistrationClientId '<appId>'" -ForegroundColor White
+            Write-Host "" -ForegroundColor Yellow
+            exit 1
+        }
+        $funcAppClientId = $funcAppClientId.Trim()
+        Write-Host "  Created app registration: $funcAppClientId" -ForegroundColor Gray
+    }
+}
 
-# Replace placeholders in connections
-$connectionsContent = $connectionsContent `
-    -replace '{{SUBSCRIPTION_ID}}', $subscription `
-    -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
-    -replace '{{LOCATION}}', $Location.ToLower() `
-    -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
-    -replace '{{AZURE_MONITOR_LOGS_RUNTIME_URL}}', $azureMonitorLogsRuntimeUrl `
-    -replace '{{AZURE_BLOB_RUNTIME_URL}}', $azureBlobRuntimeUrl
+# Apply EasyAuth v2 settings to the Function App via ARM REST API.
+$authSettings = @{
+    properties = @{
+        globalValidation = @{
+            requireAuthentication         = $true
+            unauthenticatedClientAction   = 'Return401'
+        }
+        identityProviders = @{
+            azureActiveDirectory = @{
+                enabled      = $true
+                registration = @{
+                    openIdIssuer = "https://sts.windows.net/$tenantId/v2.0"
+                    clientId     = $funcAppClientId
+                }
+                validation   = @{
+                    allowedAudiences             = @($funcAudience)
+                    defaultAuthorizationPolicy   = @{
+                        allowedPrincipals = @{
+                            identities = @($userManagedIdentityPrincipalId)
+                        }
+                    }
+                }
+            }
+        }
+        login = @{ tokenStore = @{ enabled = $false } }
+    }
+}
+$authTempFile = [System.IO.Path]::GetTempFileName() + '.json'
+$authSettings | ConvertTo-Json -Depth 10 | Set-Content $authTempFile -Encoding UTF8
+az rest --method PUT `
+    --url "https://management.azure.com/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$zipFunctionAppName/config/authsettingsV2?api-version=2022-09-01" `
+    --headers "Content-Type=application/json" `
+    --body "@$authTempFile" --output none
+Remove-Item $authTempFile -ErrorAction SilentlyContinue
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Failed to configure EasyAuth on Function App" -ForegroundColor Red
+    exit 1
+}
+Write-Host "✓ Entra ID authentication configured (app: $funcAppClientId)" -ForegroundColor Green
 
-$connectionsContent | Set-Content $connectionsPath -Encoding UTF8
-
-Write-Host "✓ Workflow and connections updated" -ForegroundColor Green
+# Store the plain function URL as a Logic App app setting.
+# Authentication is handled via Managed Identity (EasyAuth) - no key needed.
+$zipFunctionUrl = "https://$zipFunctionAppName.azurewebsites.net/api/ZipCsv"
+Write-Host "  Storing function URL as Logic App app setting..." -ForegroundColor Gray
+az logicapp config appsettings set `
+    --name $logicAppName `
+    --resource-group $ResourceGroupName `
+    --settings "ZipCsvFunctionUrl=$zipFunctionUrl" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Failed to set ZipCsvFunctionUrl app setting on Logic App" -ForegroundColor Red
+    exit 1
+}
+Write-Host "✓ Zip CSV Function deployed" -ForegroundColor Green
 
 Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
 Set-Location $PSScriptRoot
@@ -420,33 +536,75 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Using Azure Functions Core Tools version: $funcVersion" -ForegroundColor Gray
 
-# Generate local.settings.json required by func CLI to identify the project runtime.
-# Logic App Standard on dotnet runtime requires this to be present for func publish.
-$localSettingsPath = Join-Path $PSScriptRoot "local.settings.json"
-$localSettings = @{
-    IsEncrypted = $false
-    Values      = @{
-        FUNCTIONS_WORKER_RUNTIME = "dotnet"
-        AzureWebJobsStorage      = ""
+# Stage all Logic App files into a temp directory so placeholder tokens are never
+# written back to the source files. The source files always stay as templates.
+$tempDeployDir = Join-Path $env:TEMP "chargeback-deploy-$(Get-Date -Format 'yyyyMMddHHmmss')"
+New-Item -ItemType Directory -Path $tempDeployDir | Out-Null
+Write-Host "  Staging files to: $tempDeployDir" -ForegroundColor Gray
+
+$deploySucceeded = $false
+try {
+    # host.json needs no substitution
+    Copy-Item (Join-Path $PSScriptRoot "host.json") $tempDeployDir
+
+    # connections.json - resolve placeholders into the staged copy
+    $connectionsContent = Get-Content (Join-Path $PSScriptRoot "connections.json") -Raw
+    $connectionsContent = $connectionsContent `
+        -replace '{{SUBSCRIPTION_ID}}', $subscription `
+        -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
+        -replace '{{LOCATION}}', $Location.ToLower() `
+        -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
+        -replace '{{AZURE_MONITOR_LOGS_RUNTIME_URL}}', $azureMonitorLogsRuntimeUrl `
+        -replace '{{AZURE_BLOB_RUNTIME_URL}}', $azureBlobRuntimeUrl
+    $connectionsContent | Set-Content (Join-Path $tempDeployDir "connections.json") -Encoding UTF8
+
+    # Each workflow subfolder - resolve placeholders into staged copies
+    Get-ChildItem -Path $PSScriptRoot -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName "workflow.json") } |
+        ForEach-Object {
+            $destDir = Join-Path $tempDeployDir $_.Name
+            New-Item -ItemType Directory -Path $destDir | Out-Null
+            $workflowContent = Get-Content (Join-Path $_.FullName "workflow.json") -Raw
+            $workflowContent = $workflowContent `
+                -replace '{{SUBSCRIPTION_ID}}', $subscription `
+                -replace '{{RESOURCE_GROUP}}', $ResourceGroupName `
+                -replace '{{SOURCE_WORKSPACE}}', $SourceLogAnalyticsWorkspace `
+                -replace '{{SOURCE_WORKSPACE_RG}}', $SourceWorkspaceResourceGroup `
+                -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
+                -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
+                -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
+                -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
+                -replace '{{ZIP_FUNCTION_APP_NAME}}', $zipFunctionAppName `
+                -replace '{{ZIP_FUNCTION_AUDIENCE}}', $funcAudience
+            $workflowContent | Set-Content (Join-Path $destDir "workflow.json") -Encoding UTF8
+        }
+
+    # local.settings.json is required by func CLI but should never be committed
+    @{
+        IsEncrypted = $false
+        Values      = @{
+            FUNCTIONS_WORKER_RUNTIME = "dotnet"
+            AzureWebJobsStorage      = ""
+        }
+    } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $tempDeployDir "local.settings.json") -Encoding UTF8
+
+    # Publish from the staged copy
+    Set-Location $tempDeployDir
+    Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
+    $publishOutput = func azure functionapp publish $LogicAppName 2>&1
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
+        Write-Host "Output: $publishOutput" -ForegroundColor Yellow
+    } else {
+        $deploySucceeded = $true
+        Write-Host "✓ Workflow deployed" -ForegroundColor Green
     }
+} finally {
+    Set-Location $PSScriptRoot
+    Remove-Item $tempDeployDir -Recurse -Force -ErrorAction SilentlyContinue
 }
-$localSettings | ConvertTo-Json -Depth 5 | Set-Content $localSettingsPath -Encoding UTF8
-Write-Host "  Generated local.settings.json for func CLI" -ForegroundColor Gray
-
-# Deploy workflow - capture output to show errors
-Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
-$publishOutput = func azure functionapp publish $LogicAppName 2>&1
-
-# Clean up the generated local.settings.json regardless of outcome
-Remove-Item $localSettingsPath -ErrorAction SilentlyContinue
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Workflow deployment failed" -ForegroundColor Red
-    Write-Host "Output: $publishOutput" -ForegroundColor Yellow
-    exit 1
-}
-
-Write-Host "✓ Workflow deployed" -ForegroundColor Green
+if (-not $deploySucceeded) { exit 1 }
 
 Write-Host "`nStep 8: Restarting Logic App to apply permissions..." -ForegroundColor Cyan
 Write-Host "  This ensures all RBAC permissions and identity tokens are refreshed" -ForegroundColor Gray
@@ -461,17 +619,18 @@ Write-Host "  User Managed Identity: $userManagedIdentityName" -ForegroundColor 
 Write-Host "  User Managed Identity Principal ID: $userManagedIdentityPrincipalId" -ForegroundColor White
 Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor White
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor White
+Write-Host "  Zip CSV Function App: $zipFunctionAppName" -ForegroundColor White
 Write-Host "  Error Workspace: $errorWorkspaceName" -ForegroundColor White
 Write-Host ""
 Write-Host "RBAC Assignments:" -ForegroundColor Cyan
 Write-Host "  ✓ Website Contributor on Logic App (for dynamic schema)" -ForegroundColor White
 Write-Host "  ✓ Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
-Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
+Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Storage Blob Data Contributor on $reportStorageAccountName (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Monitoring Metrics Publisher on DCR/DCE (via Bicep)" -ForegroundColor White
 Write-Host ""
 Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Verify workflow in Azure Portal: https://portal.azure.com/#resource/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$LogicAppName" -ForegroundColor White
-Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/dailyChargeBackReport.csv" -ForegroundColor White
+Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/ (*.parquet files)" -ForegroundColor White
 Write-Host "  3. Monitor errors in workspace: $errorWorkspaceName (table: WorkflowFailures_CL)" -ForegroundColor White
 Write-Host ""

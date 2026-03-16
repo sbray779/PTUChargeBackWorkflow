@@ -19,6 +19,8 @@ The solution uses **Bicep templates** and **PowerShell** to deploy a complete in
 - **Storage Accounts** — Separate accounts for Logic App internal storage and report output
 - **Log Analytics Workspace** — Error logging and monitoring
 - **Data Collection Rule/Endpoint** — Custom log ingestion for workflow errors
+- **Zip CSV Function App** — .NET 10 isolated Azure Function that compresses the daily CSV into a ZIP archive; secured via Entra ID EasyAuth with Managed Identity authentication (no function keys)
+- **Entra ID App Registration** — Backs EasyAuth on the Zip Function App; created by the deploy script or pre-created by an admin in restricted tenants
 - **RBAC Assignments** — All necessary permissions configured automatically
 
 ## Workflow Overview
@@ -51,16 +53,18 @@ Instead of running a single 24-hour query, it splits the time range into **12 x 
 6. **Submit_Daily_Query** — Queries `ChargeBackChunks_CL` (error workspace), filtered by `WorkflowRunId` and `ReportDate`, to re-aggregate all 12 chunks into a single daily summary
 7. **Check_Daily_Sync_Or_Async** — Async polling pattern (same as chunk queries)
 8. **Get_Daily_Results** → **Transform_Daily_To_Objects** → **Create_Daily_CSV**
-9. **Write_Daily_Report_Blob** — Writes one CSV to blob storage with a date-time-stamped filename: `chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
+9. **Zip_CSV** — POSTs the CSV to the ZipCsv Azure Function, which compresses it into a ZIP archive
+10. **Write_Daily_Report_Blob** — Writes the ZIP archive to blob storage with a date-time-stamped filename: `chargeBack-daily-YYYY-MM-DD-HHmmss.zip`
 
-**Output** — One CSV file per run:
-- `reportoutput/chargeBack-daily-YYYY-MM-DD-HHmmss.csv`
+**Output** — One ZIP file per run:
+- `reportoutput/chargeBack-daily-YYYY-MM-DD-HHmmss.zip`
+- Contains a single date-time-stamped CSV matching the outer ZIP name (e.g. `chargeBack-daily-2026-03-10-143022.csv`)
 - Contains fully aggregated daily data (all 2-hour windows combined)
 - Each run produces a unique file; previous runs are preserved
 
 **Error Handlers** (run on failure/timeout of upstream actions):
 - **Handle_Query_Failure** — Logs query errors to `WorkflowFailures_CL` via Data Collection Rules
-- **Handle_Blob_Write_Failure** — Logs blob write errors to the same table
+- **Handle_Blob_Write_Failure** — Logs zip/blob write errors to the same table (fires on `Zip_CSV` or `Write_Daily_Report_Blob` failure)
 
 ### Why Time Chunking + Intermediate Staging?
 
@@ -71,16 +75,18 @@ Log Analytics queries have a 5GB memory limit for joins. With high-volume APIM t
 - `WorkflowRunId` tagging enables idempotent re-runs: re-running on the same day produces a new timestamped file without corrupting previous runs
 - The Logs Ingestion API ingestion step is fault-tolerant: if ingestion is slow, the poll loop waits up to 20 minutes before proceeding
 
-This approach is a pure Logic App solution with no external dependencies on Azure Functions or JavaScript code actions, ensuring compatibility with .NET-based Logic App Standard runtimes
+This approach avoids Logic App memory limits and is fault-tolerant across both ingestion timing and zip compression, with all phases coordinated from a single Logic App workflow.
 
 ## Prerequisites
 
 - **Azure CLI** installed and authenticated (`az login`)
 - **Bicep CLI** installed (included with Azure CLI or install via `az bicep install`)
 - **Azure Functions Core Tools** installed (`func`) - for workflow deployment
+- **.NET 10 SDK** installed (`dotnet`) - for building the ZipCsv Function App
 - **PowerShell 7.0 or later**
 - **Contributor access** to the target Azure subscription
 - An **existing Log Analytics workspace** containing `ApiManagementGatewayLogs` and `ApiManagementGatewayLlmLog` tables
+- **Entra ID app registration permissions** (or a pre-created app registration — see [Restricted Tenant Deployments](#restricted-tenant-deployments) below)
 
 ## Deployment (Full — New Infrastructure)
 
@@ -112,18 +118,20 @@ param sourceWorkspaceResourceGroup = '<your-source-workspace-resource-group>'
 .\Deploy-ChargeBackLogicApp-v2.ps1
 ```
 
-The script executes 8 steps automatically:
+The script executes 9 steps automatically:
 
 | Step | Action |
 |------|--------|
 | 1 | Create or verify resource group |
-| 2 | Deploy infrastructure via Bicep (Logic App, storage, identity, DCR/DCE, RBAC) |
+| 2 | Deploy infrastructure via Bicep (Logic App, storage, identity, DCR/DCE, RBAC, Zip Function App) |
 | 3 | Create API connections (Azure Monitor Logs + Azure Blob) with managed identity access policies |
 | 4 | Retrieve connection runtime URLs |
 | 5 | Assign RBAC roles (Website Contributor, Log Analytics Reader, Reader on source workspace) |
-| 6 | Substitute `{{placeholders}}` in `workflow.json` and `connections.json` with deployment values |
-| 7 | Deploy workflow to Logic App via `func azure functionapp publish` |
-| 8 | Restart Logic App to apply permissions |
+| 6 | Build and deploy ZipCsv Function App (`dotnet publish` + zip deploy) |
+| 6b | Create Entra ID app registration and configure EasyAuth on the Zip Function App |
+| 7 | Substitute `{{placeholders}}` in `workflow.json` and `connections.json` with deployment values |
+| 8 | Deploy workflow to Logic App via `func azure functionapp publish` |
+| 9 | Restart Logic App to apply permissions |
 
 ### Step 3: Verify
 
@@ -141,6 +149,36 @@ The script executes 8 steps automatically:
    ```
 4. Check run history for success/failure
 5. Verify the 12 chunk CSV files appear in storage: `rptcb{suffix}/reportoutput/chargeBack-chunk-*.csv`
+
+## Restricted Tenant Deployments
+
+Step 6b creates an Entra ID app registration to back the EasyAuth configuration on the Zip CSV Function App. In tenants where app registration creation is restricted to administrators, this step will fail and print the exact commands needed.
+
+### Pre-creating the App Registration (Admin Steps)
+
+An admin needs to know the **Zip Function App name** before running the deploy script. The name follows the pattern `func-zipcsv-{suffix}` where `{suffix}` matches the `resourceToken` in the Bicep output — or just run the deployment once to get the name from the error output.
+
+Once you have the function app name, an admin runs:
+
+```bash
+# Replace <tenant-id> with your Azure tenant ID and <func-app-name> with the actual function app name
+az ad app create \
+  --display-name "<func-app-name>-auth" \
+  --identifier-uris "api://<tenant-id>/<func-app-name>" \
+  --query appId -o tsv
+```
+
+The command outputs an Application (client) ID — share this with the deployer.
+
+### Running the Deployment with a Pre-Created Registration
+
+```powershell
+.\Deploy-ChargeBackLogicApp-v2.ps1 -ZipFunctionAppRegistrationClientId "<appId from admin>"
+```
+
+The script will skip creation, apply the provided `clientId` to EasyAuth, and continue normally.
+
+> **Re-deployments:** On subsequent deployments (e.g., after deleting and recreating resources), the same app registration can be reused. The deploy script will update the `identifier-uris` to match the new function app name if needed. If the function app name changes, a new registration is required.
 
 ## Deployment (Workflow Only — Existing Logic App)
 
@@ -164,29 +202,43 @@ The `workflow.json` and `connections.json` files contain `{{placeholder}}` token
 | `{{DCR_IMMUTABLE_ID}}` | Data Collection Rule immutable ID | `az monitor data-collection rule show --name <name> --resource-group <rg> --query immutableId -o tsv` |
 | `{{AZURE_MONITOR_LOGS_RUNTIME_URL}}` | Azure Monitor Logs API connection runtime URL | Azure Portal → API Connections → azuremonitorlogs → Properties |
 | `{{AZURE_BLOB_RUNTIME_URL}}` | Azure Blob API connection runtime URL | Azure Portal → API Connections → azureblob → Properties |
+| `{{ZIP_FUNCTION_AUDIENCE}}` | EasyAuth token audience for the Zip CSV Function App — format `api://<tenantId>/<func-app-name>` | Tenant ID: `az account show --query tenantId -o tsv`; App name: `az functionapp list --resource-group <rg> --query "[?contains(name,'zipcsv')].name" -o tsv` |
+| `{{SUBSCRIPTION_ID}}` | Azure subscription ID (used in connections.json) | `az account show --query id -o tsv` |
+| `{{RESOURCE_GROUP}}` | Resource group name (used in connections.json) | Value from `deploy-infrastructure.bicepparam` |
 
 Replace placeholders using PowerShell:
 
+> **WARNING**: This modifies source files directly. Revert your changes with `git checkout` after publishing — do not commit files with resolved placeholder values.
+
 ```powershell
 # Set your values
-$identityId = "<your-managed-identity-resource-id>"
-$dceEndpoint = "<your-dce-endpoint-url>"
+$identityId     = "<your-managed-identity-resource-id>"
+$dceEndpoint    = "<your-dce-endpoint-url>"
 $dcrImmutableId = "<your-dcr-immutable-id>"
 $monitorLogsUrl = "<your-azuremonitorlogs-runtime-url>"
-$blobUrl = "<your-azureblob-runtime-url>"
+$blobUrl        = "<your-azureblob-runtime-url>"
+$zipFuncName    = "<your-zip-function-app-name>"   # e.g. func-zipcsv-abc123xyz
+$subscriptionId = "<your-subscription-id>"
+$resourceGroup  = "<your-resource-group-name>"
 
 # Replace in workflow.json
+$tenantId       = az account show --query tenantId -o tsv
+$zipFuncAudience = "api://$tenantId/$zipFuncName"
 $wf = Get-Content .\CreateChargeBackReport\workflow.json -Raw
 $wf = $wf -replace '\{\{USER_MANAGED_IDENTITY_ID\}\}', $identityId `
           -replace '\{\{DCE_ENDPOINT\}\}', $dceEndpoint `
-          -replace '\{\{DCR_IMMUTABLE_ID\}\}', $dcrImmutableId
+          -replace '\{\{DCR_IMMUTABLE_ID\}\}', $dcrImmutableId `
+          -replace '\{\{ZIP_FUNCTION_APP_NAME\}\}', $zipFuncName `
+          -replace '\{\{ZIP_FUNCTION_AUDIENCE\}\}', $zipFuncAudience
 $wf | Set-Content .\CreateChargeBackReport\workflow.json -Encoding UTF8
 
 # Replace in connections.json
 $conn = Get-Content .\connections.json -Raw
 $conn = $conn -replace '\{\{USER_MANAGED_IDENTITY_ID\}\}', $identityId `
               -replace '\{\{AZURE_MONITOR_LOGS_RUNTIME_URL\}\}', $monitorLogsUrl `
-              -replace '\{\{AZURE_BLOB_RUNTIME_URL\}\}', $blobUrl
+              -replace '\{\{AZURE_BLOB_RUNTIME_URL\}\}', $blobUrl `
+              -replace '\{\{SUBSCRIPTION_ID\}\}', $subscriptionId `
+              -replace '\{\{RESOURCE_GROUP\}\}', $resourceGroup
 $conn | Set-Content .\connections.json -Encoding UTF8
 ```
 
@@ -214,13 +266,17 @@ az logicapp restart --name <your-logic-app-name> --resource-group <your-resource
 | User-Assigned Managed Identity | `id-chargeback-{suffix}` | Centralized authentication for all services |
 | Logic App | `logic-chargeback-{suffix}` | Workflow engine |
 | Logic App Storage | `lacb{suffix}` | Internal runtime storage (key-based auth required) |
-| Report Storage | `rptcb{suffix}` | CSV report output (managed identity only, no keys) |
-| Blob Container | `reportoutput` | Container for daily CSV reports |
+| Report Storage | `rptcb{suffix}` | ZIP report output (managed identity only, no keys) |
+| Blob Container | `reportoutput` | Container for daily ZIP reports |
 | Log Analytics Workspace | `law-chargeback-{suffix}` | Error logging and chunk staging |
 | Custom Table | `WorkflowFailures_CL` | Schema for workflow error records |
 | Custom Table | `ChargeBackChunks_CL` | Intermediate staging for 12 chunk results per run |
 | Data Collection Endpoint | `dce-chargeback-{suffix}` | Log ingestion endpoint |
 | Data Collection Rule | `dcr-chargeback-{suffix}` | Routes errors + chunk data to custom tables |
+| App Service Plan (Zip Function) | `asp-zipcsv-{suffix}` | Y1 Consumption plan for ZipCsv Function |
+| Zip CSV Function App | `func-zipcsv-{suffix}` | .NET 10 isolated HTTP Function; receives CSV via HTTP POST, returns ZIP bytes; secured by Entra ID EasyAuth (Managed Identity auth, no function keys) |
+| Zip Function Storage | `fnzip{suffix}` | Internal storage for the Zip CSV Function App |
+| Entra ID App Registration | `{func-app-name}-auth` | Backs EasyAuth on the Zip Function App; token audience = `api://<tenantId>/<func-app-name>`; created by deploy script or pre-created by admin (see [Restricted Tenant Deployments](#restricted-tenant-deployments)) |
 
 ### API Connections (via PowerShell)
 
@@ -282,17 +338,25 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 │  │  │   ▼ Submit_Daily_Query (ChargeBackChunks_CL, by WorkflowRunId)│  │   │
 │  │  │   ▼ Check_Daily_Sync_Or_Async → Get_Daily_Results            │  │   │
 │  │  │   ▼ Transform_Daily_To_Objects → Create_Daily_CSV            │  │   │
-│  │  │   ▼ Write_Daily_Report_Blob                                  │  │   │
-│  │  │     Output: chargeBack-daily-YYYY-MM-DD-HHmmss.csv           │  │   │
+  │  │   ▼ Zip_CSV (HTTP POST → ZipCsv Function App)               │  │   │
+  │  │   ▼ Write_Daily_Report_Blob                                  │  │   │
+  │  │     Output: chargeBack-daily-YYYY-MM-DD-HHmmss.zip           │  │   │
 │  │  └──────────────────────────────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │           │                                                                │
 │  ┌────────┴───────┐  ┌────────────────────────────────────────┐           │
 │  │ Storage (lacb*)│  │ Storage (rptcb*)                       │           │
 │  │ Internal       │  │ reportoutput/                          │           │
-│  │ (Key Auth)     │  │   chargeBack-daily-2026-03-09-143022.csv│           │
-│  └────────────────┘  │ (Managed ID Only, 1 file per run)     │           │
+│  │ (Key Auth)     │  │   chargeBack-daily-2026-03-09-143022.zip│           │
+│  └────────────────┘  │ (Managed ID Only, 1 ZIP per run)      │           │
 │                      └────────────────────────────────────────┘           │
+│                                                                            │
+│  ┌──────────────────────────────────────────────────────────┐             │
+│  │ Zip CSV Function App (func-zipcsv-*)                     │             │
+│  │ .NET 10 isolated, Consumption plan                       │             │
+│  │ EasyAuth: Managed Identity auth (no function keys)       │             │
+│  │ POST /api/ZipCsv → receives CSV → returns ZIP bytes      │             │
+│  └──────────────────────────────────────────────────────────┘             │
 │                                                                            │
 │  ┌────────────────┐  ┌────────────────────────────────────────┐           │
 │  │ DCE/DCR        │─▶│ Error Workspace (law-chargeback-*)      │           │
@@ -318,8 +382,8 @@ All RBAC roles are assigned to the **user-assigned managed identity** (`id-charg
 Executed against the **source Log Analytics workspace** (APIM logs) for each 2-hour time chunk. Results are staged into `ChargeBackChunks_CL` via the Logs Ingestion API:
 
 ```kql
-// Compute time window: covers 24h ending at REPORT_END_HOUR yesterday
-let reportEnd = datetime_add('hour', int(REPORT_END_HOUR), startofday(now() - 1d));
+// Compute time window: covers 24h ending at REPORT_END_HOUR today
+let reportEnd = datetime_add('hour', int(REPORT_END_HOUR), startofday(now()));
 let chunkStart = datetime_add('hour', -hoursAgo, reportEnd);
 let chunkEnd   = datetime_add('hour', -hoursUntil, reportEnd);
 
@@ -456,7 +520,7 @@ The `Transform_Chunk_To_Objects` action maps the columnar result to named fields
 
 ### Monitor
 
-- **Report Output**: Check blob storage container `reportoutput` for daily files (`chargeBack-daily-*.csv`). Each workflow run produces one file with a unique date-time stamp, preserving history across re-runs
+- **Report Output**: Check blob storage container `reportoutput` for daily ZIP files (`chargeBack-daily-*.zip`). Each ZIP contains a single date-time-stamped CSV (e.g. `chargeBack-daily-2026-03-10-143022.csv`). Each workflow run produces one file, preserving history across re-runs
 - **Workflow Runs**: View run history in Logic App portal → Workflows → CreateChargeBackReport- **Chunk Staging**: Query `ChargeBackChunks_CL` in the error workspace to inspect staged data per run:
 
 ```kql
@@ -530,6 +594,18 @@ If the portal shows old action definitions after publishing:
 4. Re-run the full deployment script (`Deploy-ChargeBackLogicApp-v2.ps1`)
 
 This happens because Logic App Standard stores workflow definitions in an Azure Files share, and file-level deployments may not always clear the cache.
+
+### Zip CSV OAuth Error (WorkflowAppOAuthTokenFailure)
+
+If the `Zip_CSV` action fails with `AADSTS500011: The resource principal named ... was not found in the tenant`:
+
+1. **Missing app registration** — The Entra ID app registration backing EasyAuth either wasn't created or uses a different identifier URI. Check whether `{func-app-name}-auth` exists in Entra ID:
+   ```bash
+   az ad app list --display-name func-zipcsv-<suffix>-auth --query "[].{appId:appId,uri:identifierUris}" -o table
+   ```
+2. **Wrong audience** — The `authentication.audience` in the `Zip_CSV` action must exactly match the app registration's `identifierUri` (`api://<tenantId>/<func-app-name>`). Verify the `{{ZIP_FUNCTION_AUDIENCE}}` placeholder was substituted correctly in the deployed workflow.
+3. **Restricted tenant** — If app registration creation is blocked for the deployer, see [Restricted Tenant Deployments](#restricted-tenant-deployments) and provide the pre-created `appId` via `-ZipFunctionAppRegistrationClientId`.
+4. **Re-run Step 6b only** — If the function app was redeployed with a new name, re-run the deploy script to recreate the registration and reconfigure EasyAuth.
 
 ### Service Unavailable in Portal
 
@@ -631,18 +707,21 @@ Edit `Recurrence` trigger:
 
 The daily output filename is built in the `Write_Daily_Report_Blob` action:
 ```
-chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv
+chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.zip
 ```
 
-Each run produces a unique file. Previous runs are preserved. To change the pattern, edit the `name` field in the `queries` block of `Write_Daily_Report_Blob` in `CreateChargeBackReport/workflow.json`.
+The CSV entry inside the ZIP shares the same date-time stamp (e.g. `chargeBack-daily-2026-03-10-143022.csv`). The filename is passed as a `?filename=` query parameter to the `Zip_CSV` action.
+
+Each run produces a unique file. Previous runs are preserved. To change the naming pattern, edit the `name` field in `Write_Daily_Report_Blob` and the `filename` query parameter in the `Zip_CSV` action URI, both in `CreateChargeBackReport/workflow.json`.
 
 ## Files
 
 ```
 PTUChargeBackWorkflow/
-├── Deploy-ChargeBackLogicApp-v2.ps1       # Full deployment script (8 steps)
+├── Deploy-ChargeBackLogicApp-v2.ps1       # Full deployment script (9 steps incl. 6b)
 ├── deploy-infrastructure.bicep            # Bicep template for all infrastructure
 ├── deploy-infrastructure.bicepparam       # Deployment parameters (edit before deploying)
+├── nuget.config                           # NuGet source override (restores from nuget.org)
 ├── modules/
 │   └── logAnalyticsRbac.bicep             # Cross-resource-group RBAC module
 ├── connections.json                       # API connection definitions ({{placeholders}})
@@ -651,6 +730,11 @@ PTUChargeBackWorkflow/
 ├── parameters.json                        # ARM parameters (legacy)
 ├── CreateChargeBackReport/
 │   └── workflow.json                      # Workflow definition ({{placeholders}})
+├── ZipCsvFunction/
+│   ├── ZipCsvFunction.csproj              # .NET 10 isolated worker project
+│   ├── ZipCsv.cs                          # HTTP trigger: receives CSV bytes, returns ZIP
+│   ├── Program.cs                         # Worker host entry point
+│   └── host.json                          # Function host configuration
 ├── workflow-designtime/
 │   ├── host.json                          # Design-time host config
 │   └── local.settings.json               # Design-time local settings
@@ -659,7 +743,7 @@ PTUChargeBackWorkflow/
 
 ## Important Notes
 
-1. **Placeholder Tokens**: The `workflow.json` and `connections.json` files contain `{{placeholder}}` tokens (e.g., `{{USER_MANAGED_IDENTITY_ID}}`) that are replaced at deployment time by Step 6 of the deployment script. Do not commit files with hardcoded deployment values.
+1. **Placeholder Tokens**: The `workflow.json` and `connections.json` files contain `{{placeholder}}` tokens (e.g., `{{USER_MANAGED_IDENTITY_ID}}`) that are resolved at deployment time by Step 7 of the deploy script into a **temporary staging directory** — the source files are never overwritten with deployment-specific values. Do not commit files with hardcoded deployment values.
 
 2. **User-Assigned Managed Identity**: The solution uses a user-assigned managed identity (`id-chargeback-{suffix}`) instead of system-assigned. This provides better lifecycle management and allows the identity to persist independently of the Logic App.
 
@@ -675,7 +759,9 @@ PTUChargeBackWorkflow/
 
 8. **Resource Naming**: All resource names include a deterministic suffix generated by `uniqueString(resourceGroup().id)` to ensure uniqueness across Azure.
 
-9. **Pure Logic App Solution**: This workflow runs entirely within Logic App Standard with no external dependencies on Azure Functions or JavaScript code actions, ensuring full compatibility with .NET-based runtimes.
+9. **ZipCsv Authentication**: The ZipCsv Azure Function is secured via Entra ID EasyAuth — no function keys are used. The Logic App authenticates using its user-assigned managed identity, which is the only allowed caller. The Entra ID app registration (`{func-app-name}-auth`) serves as the token audience (`https://{func-app-name}.azurewebsites.net`) and is created by the deploy script during Step 6b.
+
+10. **Source Files Never Modified by Deployment**: The deploy script resolves `{{placeholder}}` tokens only in a temp staging directory (`$env:TEMP\chargeback-deploy-{timestamp}`). Source files always retain their placeholder tokens, making the repository safe to commit at any point without risk of leaking subscription IDs, endpoints, or keys.
 
 ## License
 

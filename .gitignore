@@ -2,6 +2,7 @@
 # Azure logic apps artifacts
 bin
 obj
+publish
 appsettings.json
 local.settings.json
 __blobstorage__
