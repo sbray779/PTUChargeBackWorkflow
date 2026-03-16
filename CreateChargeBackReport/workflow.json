@@ -314,7 +314,7 @@
                 "TimeGenerated": "@{utcNow()}",
                 "ReportDate": "@{variables('ReportDate')}",
                 "WorkflowRunId": "@{variables('WorkflowRunId')}",
-                "ChunkId": "@{items('Process_Time_Chunks')['chunkId']}",
+                "ChunkId": "@items('Process_Time_Chunks')['chunkId']",
                 "ProductId": "@item()['ProductId']",
                 "Luma": "@item()['Luma']",
                 "Workspace": "@item()['Workspace']",
@@ -770,7 +770,7 @@
           "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
           "queries": {
             "folderPath": "reportoutput",
-            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv",
+            "name": "chargeBack-daily-@{variables('ReportDate')}.csv",
             "queryParametersSingleEncoded": true
           }
         },
