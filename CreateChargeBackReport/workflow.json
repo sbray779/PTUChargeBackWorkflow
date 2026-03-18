@@ -49,7 +49,7 @@
             {
               "name": "ReportDate",
               "type": "string",
-              "value": "@{formatDateTime(utcNow(), 'yyyy-MM-dd')}"
+              "value": "@{formatDateTime(subtractFromTime(utcNow(), 1, 'Day'), 'yyyy-MM-dd')}"
             }
           ]
         },
@@ -95,6 +95,42 @@
           ]
         }
       },
+      "Initialize_Chunk_Batch_Offset": {
+        "type": "InitializeVariable",
+        "description": "Tracks the row offset used when splitting large chunks into sub-1 MB batches for the Logs Ingestion API. Reset to 0 inside the loop via SetVariable before each chunk's batch loop.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "ChunkBatchOffset",
+              "type": "integer",
+              "value": 0
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Expected_Chunk_Count": [
+            "Succeeded"
+          ]
+        }
+      },
+      "Initialize_Batch_Write_Failed": {
+        "type": "InitializeVariable",
+        "description": "Flag set to true if any Logs Ingestion API batch POST fails after all retries. Causes the workflow to terminate with a failure rather than silently produce an incomplete report.",
+        "inputs": {
+          "variables": [
+            {
+              "name": "BatchWriteFailed",
+              "type": "boolean",
+              "value": false
+            }
+          ]
+        },
+        "runAfter": {
+          "Initialize_Chunk_Batch_Offset": [
+            "Succeeded"
+          ]
+        }
+      },
       "Process_Time_Chunks": {
         "type": "Foreach",
         "description": "Process each 2-hour chunk: query Log Analytics, transform rows, enrich with run metadata, and write to ChargeBackChunks_CL via the Logs Ingestion API.",
@@ -108,7 +144,7 @@
               "method": "POST",
               "headers": {
                 "Content-Type": "application/json",
-                "Prefer": "wait=0"
+                "Prefer": "wait=60"
               },
               "body": {
                 "query": "let reportEnd = datetime_add('hour', @{int(appsetting('REPORT_END_HOUR'))}, startofday(now() - 1d)); let chunkStart = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursAgo']}, reportEnd); let chunkEnd = datetime_add('hour', -@{items('Process_Time_Chunks')['hoursUntil']}, reportEnd); let llmAgg = ApiManagementGatewayLlmLog | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where SequenceNumber == 0 | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens) by CorrelationId; ApiManagementGatewayLogs | where TimeGenerated >= chunkStart and TimeGenerated < chunkEnd | where IsRequestSuccess | join hint.strategy=shuffle kind=inner llmAgg on CorrelationId | extend ParsedUrl = parse_url(BackendUrl) | extend ExtractedEndpoint = strcat(tostring(ParsedUrl.Scheme), '://', tostring(ParsedUrl.Host), '/') | extend DeploymentFromUrl = extract('/openai/deployments/([^/]+)/', 1, BackendUrl) | extend Luma = extract('^([0-9]{6})', 1, ApimSubscriptionId), Workspace = extract('^[0-9]{6}-(.+)$', 1, ApimSubscriptionId) | join kind=leftouter (CognitiveServicesInventory_CL | summarize arg_max(TimeGenerated, *) by AccountEndpoint, DeploymentName | project AccountEndpoint, CogSvcDeploymentName = DeploymentName, CogSvcModelName = ModelName, CogSvcSkuName = SkuName, CogSvcSkuCapacity = SkuCapacity, CogSvcAccountName = AccountName, CogSvcSubscriptionId = SubscriptionId, CogSvcAccountId = AccountId) on $left.ExtractedEndpoint == $right.AccountEndpoint, $left.DeploymentFromUrl == $right.CogSvcDeploymentName | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(TimeGenerated), LastSeen = max(TimeGenerated), Regions = strcat_array(make_set(Region, 8), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddress, 8), '; '), Calls = count() by ProductId, DeploymentFromUrl, ExtractedEndpoint, BackendId, CogSvcModelName, CogSvcSkuName, CogSvcSkuCapacity, CogSvcAccountName, CogSvcSubscriptionId, CogSvcAccountId, Luma, Workspace | project ProductId, Luma, Workspace, DeploymentName = DeploymentFromUrl, ModelName = CogSvcModelName, AccountName = CogSvcAccountName, SubscriptionId = CogSvcSubscriptionId, ResourceID = CogSvcAccountId, SkuName = CogSvcSkuName, SkuCapacity = CogSvcSkuCapacity, BackendId, Endpoint = ExtractedEndpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
@@ -278,7 +314,7 @@
                 "TimeGenerated": "@{utcNow()}",
                 "ReportDate": "@{variables('ReportDate')}",
                 "WorkflowRunId": "@{variables('WorkflowRunId')}",
-                "ChunkId": "@{items('Process_Time_Chunks')['chunkId']}",
+                "ChunkId": "@items('Process_Time_Chunks')['chunkId']",
                 "ProductId": "@item()['ProductId']",
                 "Luma": "@item()['Luma']",
                 "Workspace": "@item()['Workspace']",
@@ -321,23 +357,77 @@
               ]
             },
             "actions": {
-              "Write_Chunk_To_Logs": {
-                "type": "Http",
-                "description": "POST this chunk's enriched rows to ChargeBackChunks_CL via the Logs Ingestion API. Tagged with WorkflowRunId to enable idempotent daily re-aggregation.",
+              "Reset_Batch_Offset": {
+                "type": "SetVariable",
+                "description": "Reset the batch offset to 0 at the start of each chunk so the Until loop begins from the first row.",
                 "inputs": {
-                  "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-ChargeBackChunksStream?api-version=2023-01-01",
-                  "method": "POST",
-                  "headers": {
-                    "Content-Type": "application/json"
-                  },
-                  "body": "@body('Enrich_Chunk_Rows')",
-                  "authentication": {
-                    "type": "ManagedServiceIdentity",
-                    "identity": "{{USER_MANAGED_IDENTITY_ID}}",
-                    "audience": "https://monitor.azure.com"
-                  }
+                  "name": "ChunkBatchOffset",
+                  "value": 0
                 },
                 "runAfter": {}
+              },
+              "Post_Chunk_Batches": {
+                "type": "Until",
+                "description": "Send enriched rows to the Logs Ingestion API in 500-row batches to stay under the 1 MB per-request limit (error 430 ContentLengthLimitExceeded).",
+                "expression": "@greaterOrEquals(variables('ChunkBatchOffset'), length(body('Enrich_Chunk_Rows')))",
+                "limit": {
+                  "count": 100,
+                  "timeout": "PT15M"
+                },
+                "actions": {
+                  "Post_Chunk_Batch": {
+                    "type": "Http",
+                    "description": "POST one 500-row batch of enriched rows to ChargeBackChunks_CL via the Logs Ingestion API.",
+                    "inputs": {
+                      "uri": "{{DCE_ENDPOINT}}/dataCollectionRules/{{DCR_IMMUTABLE_ID}}/streams/Custom-ChargeBackChunksStream?api-version=2023-01-01",
+                      "method": "POST",
+                      "headers": {
+                        "Content-Type": "application/json"
+                      },
+                      "body": "@take(skip(body('Enrich_Chunk_Rows'), variables('ChunkBatchOffset')), 500)",
+                      "authentication": {
+                        "type": "ManagedServiceIdentity",
+                        "identity": "{{USER_MANAGED_IDENTITY_ID}}",
+                        "audience": "https://monitor.azure.com"
+                      }
+                    },
+                    "runAfter": {}
+                  },
+                  "Set_Batch_Write_Failed": {
+                    "type": "SetVariable",
+                    "description": "Record that a batch POST failed after all retries so the workflow can terminate with a visible failure instead of silently producing incomplete data.",
+                    "inputs": {
+                      "name": "BatchWriteFailed",
+                      "value": true
+                    },
+                    "runAfter": {
+                      "Post_Chunk_Batch": [
+                        "Failed",
+                        "TimedOut"
+                      ]
+                    }
+                  },
+                  "Advance_Batch_Offset": {
+                    "type": "IncrementVariable",
+                    "description": "Always advance the offset so the Until loop terminates even when Post_Chunk_Batch exhausts all retries and fails.",
+                    "inputs": {
+                      "name": "ChunkBatchOffset",
+                      "value": 500
+                    },
+                    "runAfter": {
+                      "Post_Chunk_Batch": [
+                        "Succeeded",
+                        "Failed",
+                        "TimedOut"
+                      ]
+                    }
+                  }
+                },
+                "runAfter": {
+                  "Reset_Batch_Offset": [
+                    "Succeeded"
+                  ]
+                }
               },
               "Increment_Expected_Chunk_Count": {
                 "type": "IncrementVariable",
@@ -347,7 +437,7 @@
                   "value": 1
                 },
                 "runAfter": {
-                  "Write_Chunk_To_Logs": [
+                  "Post_Chunk_Batches": [
                     "Succeeded"
                   ]
                 }
@@ -364,7 +454,7 @@
           }
         },
         "runAfter": {
-          "Initialize_Expected_Chunk_Count": [
+          "Initialize_Batch_Write_Failed": [
             "Succeeded"
           ]
         },
@@ -372,6 +462,40 @@
           "concurrency": {
             "repetitions": 1
           }
+        }
+      },
+      "Fail_If_Batch_Write_Failed": {
+        "type": "If",
+        "description": "Terminate the workflow immediately if any Logs Ingestion API batch POST failed after all retries. Prevents a partial report from being treated as complete.",
+        "expression": {
+          "and": [
+            {
+              "equals": [
+                "@variables('BatchWriteFailed')",
+                true
+              ]
+            }
+          ]
+        },
+        "actions": {
+          "Terminate_Batch_Write_Failed": {
+            "type": "Terminate",
+            "inputs": {
+              "runStatus": "Failed",
+              "runError": {
+                "code": "BatchWriteFailed",
+                "message": "One or more Logs Ingestion API batch POSTs failed after all retries. The report data is incomplete — check the Post_Chunk_Batch action in the run history for details."
+              }
+            }
+          }
+        },
+        "else": {
+          "actions": {}
+        },
+        "runAfter": {
+          "Process_Time_Chunks": [
+            "Succeeded"
+          ]
         }
       },
       "Wait_Before_Ingestion_Poll": {
@@ -384,7 +508,7 @@
           }
         },
         "runAfter": {
-          "Process_Time_Chunks": [
+          "Fail_If_Batch_Write_Failed": [
             "Succeeded"
           ]
         }
@@ -450,7 +574,7 @@
           "method": "POST",
           "headers": {
             "Content-Type": "application/json",
-            "Prefer": "wait=0"
+            "Prefer": "wait=60"
           },
           "body": {
             "query": "let runId = '@{variables('WorkflowRunId')}'; let reportDate = '@{variables('ReportDate')}'; union isfuzzy=true ChargeBackChunks_CL | where ReportDate == reportDate and WorkflowRunId == runId | summarize TotalTokens = sum(TotalTokens), CompletionTokens = sum(CompletionTokens), PromptTokens = sum(PromptTokens), FirstSeen = min(FirstSeen), LastSeen = max(LastSeen), Regions = strcat_array(make_set(Regions), '; '), CallerIpAddresses = strcat_array(make_set(CallerIpAddresses), '; '), Calls = sum(Calls) by ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName, SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint | project ProductId, Luma, Workspace, DeploymentName, ModelName, AccountName, SubscriptionId, ResourceID, SkuName, SkuCapacity, BackendId, Endpoint, PromptTokens, CompletionTokens, TotalTokens, Calls, FirstSeen, LastSeen, Regions, CallerIpAddresses | order by ProductId asc, TotalTokens desc"
@@ -616,21 +740,12 @@
           ]
         }
       },
-      "Zip_CSV": {
-        "type": "Http",
-        "description": "POST the daily rows (JSON array) to the ZipCsv Azure Function, which converts them to a Parquet file and returns the bytes.",
+      "Create_Daily_CSV": {
+        "type": "Table",
+        "description": "Create the final daily CSV from the re-aggregated summary rows. Each row represents total token usage for a unique ProductId + Deployment combination across the full 24-hour period.",
         "inputs": {
-          "uri": "@{concat(appsetting('ZipCsvFunctionUrl'), '?filename=chargeBack-daily-', variables('ReportDate'), '-', formatDateTime(utcNow(), 'HHmmss'), '.parquet')}",
-          "method": "POST",
-          "headers": {
-            "Content-Type": "application/json"
-          },
-          "body": "@body('Transform_Daily_To_Objects')",
-          "authentication": {
-            "type": "ManagedServiceIdentity",
-            "identity": "{{USER_MANAGED_IDENTITY_ID}}",
-            "audience": "{{ZIP_FUNCTION_AUDIENCE}}"
-          }
+          "from": "@body('Transform_Daily_To_Objects')",
+          "format": "CSV"
         },
         "runAfter": {
           "Transform_Daily_To_Objects": [
@@ -640,7 +755,7 @@
       },
       "Write_Daily_Report_Blob": {
         "type": "ApiConnection",
-        "description": "Write the daily Parquet file to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.parquet). Each run produces a unique file, preserving history across re-runs.",
+        "description": "Write the daily CSV to blob storage with a date-time-stamped name (chargeBack-daily-YYYY-MM-DD-HHmmss.csv). Each run produces a unique file, preserving history across re-runs.",
         "inputs": {
           "host": {
             "connection": {
@@ -648,19 +763,19 @@
             }
           },
           "method": "post",
-          "body": "@body('Zip_CSV')",
+          "body": "@body('Create_Daily_CSV')",
           "headers": {
             "ReadFileMetadataFromServer": true
           },
           "path": "/v2/datasets/@{encodeURIComponent(encodeURIComponent(concat('https://', appsetting('REPORT_STORAGE_ACCOUNT_NAME'), '.blob.core.windows.net/')))}/files",
           "queries": {
             "folderPath": "reportoutput",
-            "name": "chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.parquet",
+            "name": "chargeBack-daily-@{variables('ReportDate')}.csv",
             "queryParametersSingleEncoded": true
           }
         },
         "runAfter": {
-          "Zip_CSV": [
+          "Create_Daily_CSV": [
             "Succeeded"
           ]
         },
@@ -719,9 +834,9 @@
               "FailureType": "BlobWriteFailure",
               "ActionName": "Write_Daily_Report_Blob",
               "ErrorCode": "BlobWriteError",
-              "ErrorMessage": "Failed to convert to Parquet or write the daily report.",
+              "ErrorMessage": "Failed to write the daily report blob.",
               "Severity": "High",
-              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.parquet"
+              "BlobPath": "reportoutput/chargeBack-daily-@{variables('ReportDate')}-@{formatDateTime(utcNow(), 'HHmmss')}.csv"
             }
           ],
           "authentication": {
@@ -731,9 +846,6 @@
           }
         },
         "runAfter": {
-          "Zip_CSV": [
-            "Failed"
-          ],
           "Write_Daily_Report_Blob": [
             "Failed"
           ]
@@ -743,6 +855,7 @@
   },
   "kind": "Stateful"
 }
+
 
 
 

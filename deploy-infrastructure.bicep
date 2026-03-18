@@ -554,9 +554,43 @@ resource zipFunctionApp 'Microsoft.Web/sites@2022-09-01' = {
           name: 'ApplicationInsightsAgent_EXTENSION_VERSION'
           value: '~3'
         }
+        {
+          name: 'ReportStorageConnection__blobServiceUri'
+          value: 'https://${reportStorage.name}.blob.${environment().suffixes.storage}'
+        }
+        {
+          name: 'ReportStorageConnection__queueServiceUri'
+          value: 'https://${reportStorage.name}.queue.${environment().suffixes.storage}'
+        }
+        {
+          name: 'ReportStorageConnection__credential'
+          value: 'managedidentity'
+        }
       ]
       netFrameworkVersion: 'v10.0'
     }
+  }
+}
+
+// RBAC: Storage Blob Data Contributor on report storage for Function App (to read CSV and write Parquet)
+resource functionStorageBlobRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(reportStorage.id, zipFunctionApp.id, 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+  scope: reportStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
+    principalId: zipFunctionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// RBAC: Storage Queue Data Contributor on report storage for Function App (blob trigger internal operations)
+resource functionStorageQueueRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(reportStorage.id, zipFunctionApp.id, '974c5e8b-45b9-4653-ba55-5f855dd0fb88')
+  scope: reportStorage
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '974c5e8b-45b9-4653-ba55-5f855dd0fb88')
+    principalId: zipFunctionApp.identity.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 

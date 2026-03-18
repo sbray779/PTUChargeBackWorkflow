@@ -23,29 +23,15 @@
 .PARAMETER LogicAppName
     The name of the Logic App to create. Default: Logic-App-ChargeBack-Report
 
-.PARAMETER ZipFunctionAppRegistrationClientId
-    (Optional) The Application (client) ID of a pre-existing Entra ID app registration to use for
-    authenticating the Zip CSV Function App.  Required when the deployer does not have permissions
-    to create app registrations in Entra ID.  See README.md for manual creation steps.
-
 .EXAMPLE
-    # Standard deployment — script creates the app registration automatically
+    # Standard deployment
     .\Deploy-ChargeBackLogicApp-v2.ps1
-
-.EXAMPLE
-    # Deployment when the app registration was pre-created by an admin
-    .\Deploy-ChargeBackLogicApp-v2.ps1 -ZipFunctionAppRegistrationClientId "<appId from admin>"
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
-    [string]$ParametersFile = "deploy-infrastructure.bicepparam",
-
-    # Supply this when the deployer lacks permission to create Entra app registrations.
-    # An admin must first run the manual steps documented in README.md and provide the resulting appId.
-    [Parameter(Mandatory=$false)]
-    [string]$ZipFunctionAppRegistrationClientId = ""
+    [string]$ParametersFile = "deploy-infrastructure.bicepparam"
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,19 +82,45 @@ if (-not $ResourceGroupName -or -not $Location -or -not $SourceLogAnalyticsWorks
 }
 
 # Verify .NET 10 SDK is available (required to build ZipCsvFunction)
-$dotnetVersion = dotnet --version 2>&1
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: .NET SDK is not installed or not in PATH" -ForegroundColor Red
+# Check multiple locations since PATH may include older SDKs (e.g., Azure Logic Apps extension)
+$dotnetPaths = @(
+    "dotnet"                                    # Default PATH
+    "$env:ProgramFiles\dotnet\dotnet.exe"       # Standard Windows install
+    "${env:ProgramFiles(x86)}\dotnet\dotnet.exe" # x86 install
+    "$env:USERPROFILE\.dotnet\dotnet.exe"        # User install
+)
+
+$script:DotNetExe = $null
+$dotnetVersion = $null
+
+foreach ($dotnetPath in $dotnetPaths) {
+    try {
+        $testVersion = & $dotnetPath --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and $testVersion) {
+            $testMajor = [int]($testVersion -split '\.')[0]
+            if ($testMajor -ge 10) {
+                $script:DotNetExe = $dotnetPath
+                $dotnetVersion = $testVersion
+                break
+            }
+        }
+    } catch {
+        # Path doesn't exist or isn't executable, continue to next
+    }
+}
+
+if (-not $script:DotNetExe) {
+    Write-Host "ERROR: .NET 10 SDK or later is required" -ForegroundColor Red
+    Write-Host "Checked locations:" -ForegroundColor Yellow
+    foreach ($p in $dotnetPaths) { Write-Host "  - $p" -ForegroundColor Yellow }
+    $foundVersion = dotnet --version 2>$null
+    if ($foundVersion) {
+        Write-Host "Found .NET $foundVersion in PATH, but version 10+ is required" -ForegroundColor Yellow
+    }
     Write-Host "Install .NET 10 SDK from: https://aka.ms/dotnet/download" -ForegroundColor Yellow
     exit 1
 }
-$majorVersion = [int]($dotnetVersion -split '\.')[0]
-if ($majorVersion -lt 10) {
-    Write-Host "ERROR: .NET 10 SDK or later is required (found: $dotnetVersion)" -ForegroundColor Red
-    Write-Host "Install .NET 10 SDK from: https://aka.ms/dotnet/download" -ForegroundColor Yellow
-    exit 1
-}
-Write-Host "  .NET SDK version: $dotnetVersion" -ForegroundColor Gray
+Write-Host "  .NET SDK version: $dotnetVersion (using: $script:DotNetExe)" -ForegroundColor Gray
 
 Write-Host "  Resource Group: $ResourceGroupName" -ForegroundColor Gray
 Write-Host "  Location: $Location" -ForegroundColor Gray
@@ -388,13 +400,13 @@ Write-Host "✓ RBAC roles assigned" -ForegroundColor Green
 Write-Host "  Waiting 30 seconds for RBAC permissions to propagate..." -ForegroundColor Gray
 Start-Sleep -Seconds 30
 
-Write-Host "`nStep 6: Building and deploying Zip CSV Function App..." -ForegroundColor Cyan
+Write-Host "`nStep 6: Building and deploying CsvToParquet Function App..." -ForegroundColor Cyan
 
-# Build the .NET 8 isolated function
+# Build the .NET 10 isolated function (use the validated dotnet path from startup check)
 Write-Host "  Building ZipCsvFunction..." -ForegroundColor Gray
 $zipCsvProjectPath = Join-Path $PSScriptRoot "ZipCsvFunction\ZipCsvFunction.csproj"
 $zipCsvPublishPath = Join-Path $PSScriptRoot "ZipCsvFunction\publish"
-dotnet publish $zipCsvProjectPath -c Release -o $zipCsvPublishPath --nologo
+& $script:DotNetExe publish $zipCsvProjectPath -c Release -o $zipCsvPublishPath --nologo
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: dotnet publish failed for ZipCsvFunction" -ForegroundColor Red
     exit 1
@@ -416,112 +428,7 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Zip CSV Function App deployment failed" -ForegroundColor Red
     exit 1
 }
-
-Write-Host "`nStep 6b: Configuring Entra ID authentication on Zip CSV Function App..." -ForegroundColor Cyan
-# EasyAuth requires a real AAD app registration as the resource audience.
-# The function app name is only known after Bicep runs, so this cannot be done in Bicep.
-$funcAuthAppName = "$zipFunctionAppName-auth"
-# Identifier URI must include the tenant ID to satisfy org policies that require
-# a verified domain, tenant ID, or app ID in the URI (see aka.ms/identifier-uri-formatting-error).
-$funcAudience    = "api://$tenantId/$zipFunctionAppName"
-
-if ($ZipFunctionAppRegistrationClientId) {
-    # App registration was pre-created by an admin — use the supplied clientId directly.
-    $funcAppClientId = $ZipFunctionAppRegistrationClientId
-    Write-Host "  Using pre-supplied app registration: $funcAppClientId" -ForegroundColor Gray
-    # Ensure the identifier URI is set (idempotent — safe to run on existing registrations).
-    az ad app update --id $funcAppClientId --identifier-uris $funcAudience 2>&1 | Out-Null
-} else {
-    # Attempt to find an existing registration or create a new one.
-    $existingApp = az ad app list --display-name $funcAuthAppName --query "[0]" -o json 2>$null | ConvertFrom-Json
-    if ($existingApp -and $existingApp.appId) {
-        $funcAppClientId = $existingApp.appId
-        Write-Host "  Using existing app registration: $funcAppClientId" -ForegroundColor Gray
-        az ad app update --id $funcAppClientId --identifier-uris $funcAudience 2>&1 | Out-Null
-    } else {
-        Write-Host "  Creating app registration for Function App..." -ForegroundColor Gray
-        $funcAppClientId = az ad app create `
-            --display-name $funcAuthAppName `
-            --identifier-uris $funcAudience `
-            --query appId -o tsv 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "" -ForegroundColor Red
-            Write-Host "ERROR: Failed to create Entra ID app registration." -ForegroundColor Red
-            Write-Host "  This usually means your account does not have permission to create" -ForegroundColor Yellow
-            Write-Host "  app registrations in this tenant." -ForegroundColor Yellow
-            Write-Host "" -ForegroundColor Yellow
-            Write-Host "  Ask a tenant administrator to run the following commands and provide" -ForegroundColor Yellow
-            Write-Host "  you with the resulting Application (client) ID:" -ForegroundColor Yellow
-            Write-Host "" -ForegroundColor Yellow
-            Write-Host "    az ad app create ``" -ForegroundColor White
-            Write-Host "      --display-name '$funcAuthAppName' ``" -ForegroundColor White
-            Write-Host "      --identifier-uris '$funcAudience' ``" -ForegroundColor White
-            Write-Host "      --query appId -o tsv" -ForegroundColor White
-            Write-Host "" -ForegroundColor Yellow
-            Write-Host "  Then re-run this script with the -ZipFunctionAppRegistrationClientId parameter:" -ForegroundColor Yellow
-            Write-Host "" -ForegroundColor Yellow
-            Write-Host "    .\Deploy-ChargeBackLogicApp-v2.ps1 -ZipFunctionAppRegistrationClientId '<appId>'" -ForegroundColor White
-            Write-Host "" -ForegroundColor Yellow
-            exit 1
-        }
-        $funcAppClientId = $funcAppClientId.Trim()
-        Write-Host "  Created app registration: $funcAppClientId" -ForegroundColor Gray
-    }
-}
-
-# Apply EasyAuth v2 settings to the Function App via ARM REST API.
-$authSettings = @{
-    properties = @{
-        globalValidation = @{
-            requireAuthentication         = $true
-            unauthenticatedClientAction   = 'Return401'
-        }
-        identityProviders = @{
-            azureActiveDirectory = @{
-                enabled      = $true
-                registration = @{
-                    openIdIssuer = "https://sts.windows.net/$tenantId/v2.0"
-                    clientId     = $funcAppClientId
-                }
-                validation   = @{
-                    allowedAudiences             = @($funcAudience)
-                    defaultAuthorizationPolicy   = @{
-                        allowedPrincipals = @{
-                            identities = @($userManagedIdentityPrincipalId)
-                        }
-                    }
-                }
-            }
-        }
-        login = @{ tokenStore = @{ enabled = $false } }
-    }
-}
-$authTempFile = [System.IO.Path]::GetTempFileName() + '.json'
-$authSettings | ConvertTo-Json -Depth 10 | Set-Content $authTempFile -Encoding UTF8
-az rest --method PUT `
-    --url "https://management.azure.com/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$zipFunctionAppName/config/authsettingsV2?api-version=2022-09-01" `
-    --headers "Content-Type=application/json" `
-    --body "@$authTempFile" --output none
-Remove-Item $authTempFile -ErrorAction SilentlyContinue
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Failed to configure EasyAuth on Function App" -ForegroundColor Red
-    exit 1
-}
-Write-Host "✓ Entra ID authentication configured (app: $funcAppClientId)" -ForegroundColor Green
-
-# Store the plain function URL as a Logic App app setting.
-# Authentication is handled via Managed Identity (EasyAuth) - no key needed.
-$zipFunctionUrl = "https://$zipFunctionAppName.azurewebsites.net/api/ZipCsv"
-Write-Host "  Storing function URL as Logic App app setting..." -ForegroundColor Gray
-az logicapp config appsettings set `
-    --name $logicAppName `
-    --resource-group $ResourceGroupName `
-    --settings "ZipCsvFunctionUrl=$zipFunctionUrl" | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "ERROR: Failed to set ZipCsvFunctionUrl app setting on Logic App" -ForegroundColor Red
-    exit 1
-}
-Write-Host "✓ Zip CSV Function deployed" -ForegroundColor Green
+Write-Host "✓ CsvToParquet Function deployed (blob trigger for CSV to Parquet conversion)" -ForegroundColor Green
 
 Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
 Set-Location $PSScriptRoot
@@ -573,9 +480,7 @@ try {
                 -replace '{{STORAGE_ACCOUNT}}', $reportStorageAccountName `
                 -replace '{{DCE_ENDPOINT}}', $dceEndpoint `
                 -replace '{{DCR_IMMUTABLE_ID}}', $dcrImmutableId `
-                -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId `
-                -replace '{{ZIP_FUNCTION_APP_NAME}}', $zipFunctionAppName `
-                -replace '{{ZIP_FUNCTION_AUDIENCE}}', $funcAudience
+                -replace '{{USER_MANAGED_IDENTITY_ID}}', $userManagedIdentityId
             $workflowContent | Set-Content (Join-Path $destDir "workflow.json") -Encoding UTF8
         }
 
@@ -627,10 +532,13 @@ Write-Host "  ✓ Website Contributor on Logic App (for dynamic schema)" -Foregr
 Write-Host "  ✓ Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
 Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Storage Blob Data Contributor on $reportStorageAccountName (via Bicep)" -ForegroundColor White
+Write-Host "  ✓ Storage Blob Data Contributor for Function App (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Monitoring Metrics Publisher on DCR/DCE (via Bicep)" -ForegroundColor White
 Write-Host ""
 Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Verify workflow in Azure Portal: https://portal.azure.com/#resource/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$LogicAppName" -ForegroundColor White
-Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/ (*.parquet files)" -ForegroundColor White
+Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/" -ForegroundColor White
+Write-Host "     - Logic App writes: chargeBack-daily-*.csv" -ForegroundColor Gray
+Write-Host "     - Blob trigger fires Function to create: chargeBack-daily-*.parquet" -ForegroundColor Gray
 Write-Host "  3. Monitor errors in workspace: $errorWorkspaceName (table: WorkflowFailures_CL)" -ForegroundColor White
 Write-Host ""
