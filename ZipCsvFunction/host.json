@@ -1,0 +1,19 @@
+{
+  "version": "2.0",
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true
+      }
+    },
+    "logLevel": {
+      "Host.Triggers.Blob": "Debug"
+    }
+  },
+  "extensions": {
+    "blobs": {
+      "maxDegreeOfParallelism": 8,
+      "poisonBlobThreshold": 1
+    }
+  }
+}

@@ -24,7 +24,8 @@
     The name of the Logic App to create. Default: Logic-App-ChargeBack-Report
 
 .EXAMPLE
-    .\Deploy-ChargeBackLogicApp-v2.ps1 -SourceLogAnalyticsWorkspace "MyLLMLogsWorkspace" -Location "eastus2"
+    # Standard deployment
+    .\Deploy-ChargeBackLogicApp-v2.ps1
 #>
 
 [CmdletBinding()]
@@ -79,6 +80,47 @@ if (-not $ResourceGroupName -or -not $Location -or -not $SourceLogAnalyticsWorks
     Write-Host "ERROR: Failed to parse required parameters from Bicep parameters file" -ForegroundColor Red
     exit 1
 }
+
+# Verify .NET 10 SDK is available (required to build ZipCsvFunction)
+# Check multiple locations since PATH may include older SDKs (e.g., Azure Logic Apps extension)
+$dotnetPaths = @(
+    "dotnet"                                    # Default PATH
+    "$env:ProgramFiles\dotnet\dotnet.exe"       # Standard Windows install
+    "${env:ProgramFiles(x86)}\dotnet\dotnet.exe" # x86 install
+    "$env:USERPROFILE\.dotnet\dotnet.exe"        # User install
+)
+
+$script:DotNetExe = $null
+$dotnetVersion = $null
+
+foreach ($dotnetPath in $dotnetPaths) {
+    try {
+        $testVersion = & $dotnetPath --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and $testVersion) {
+            $testMajor = [int]($testVersion -split '\.')[0]
+            if ($testMajor -ge 10) {
+                $script:DotNetExe = $dotnetPath
+                $dotnetVersion = $testVersion
+                break
+            }
+        }
+    } catch {
+        # Path doesn't exist or isn't executable, continue to next
+    }
+}
+
+if (-not $script:DotNetExe) {
+    Write-Host "ERROR: .NET 10 SDK or later is required" -ForegroundColor Red
+    Write-Host "Checked locations:" -ForegroundColor Yellow
+    foreach ($p in $dotnetPaths) { Write-Host "  - $p" -ForegroundColor Yellow }
+    $foundVersion = dotnet --version 2>$null
+    if ($foundVersion) {
+        Write-Host "Found .NET $foundVersion in PATH, but version 10+ is required" -ForegroundColor Yellow
+    }
+    Write-Host "Install .NET 10 SDK from: https://aka.ms/dotnet/download" -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "  .NET SDK version: $dotnetVersion (using: $script:DotNetExe)" -ForegroundColor Gray
 
 Write-Host "  Resource Group: $ResourceGroupName" -ForegroundColor Gray
 Write-Host "  Location: $Location" -ForegroundColor Gray
@@ -158,6 +200,7 @@ $reportStorageAccountName = $deploymentOutput.properties.outputs.reportStorageAc
 $dceEndpoint = $deploymentOutput.properties.outputs.dceEndpoint.value
 $dcrImmutableId = $deploymentOutput.properties.outputs.dcrImmutableId.value
 $errorWorkspaceName = $deploymentOutput.properties.outputs.errorWorkspaceName.value
+$zipFunctionAppName = $deploymentOutput.properties.outputs.zipFunctionAppName.value
 
 Write-Host "✓ Infrastructure deployed successfully" -ForegroundColor Green
 Write-Host "  Logic App: $LogicAppName" -ForegroundColor Gray
@@ -167,8 +210,8 @@ Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor G
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor Gray
 Write-Host "  DCE Endpoint: $dceEndpoint" -ForegroundColor Gray
 Write-Host "  DCR Immutable ID: $dcrImmutableId" -ForegroundColor Gray
-
-Write-Host "`nStep 3: Creating API Connections..." -ForegroundColor Cyan
+Write-Host "  Zip Function App: $zipFunctionAppName" -ForegroundColor Gray
+Write-Host "`nStep 4: Creating API Connections..." -ForegroundColor Cyan
 
 # Get tenant ID for access policies
 $tenantId = (az account show --query tenantId --output tsv)
@@ -309,7 +352,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "✓ Azure Blob connection created" -ForegroundColor Green
 
-Write-Host "`nStep 4: Retrieving connection runtime URLs..." -ForegroundColor Cyan
+Write-Host "`nStep 5: Retrieving connection runtime URLs..." -ForegroundColor Cyan
 
 # Get Azure Monitor Logs connection runtime URL
 $azureMonitorLogsConnection = az rest --method GET `
@@ -339,7 +382,7 @@ Write-Host "  Azure Blob URL: $azureBlobRuntimeUrl" -ForegroundColor Gray
 
 Write-Host "✓ Connection runtime URLs retrieved" -ForegroundColor Green
 
-Write-Host "`nStep 5: Assigning RBAC roles..." -ForegroundColor Cyan
+Write-Host "`nStep 6: Assigning RBAC roles..." -ForegroundColor Cyan
 
 # Website Contributor on the Logic App itself for dynamic schema retrieval
 Write-Host "  Assigning Website Contributor on Logic App..." -ForegroundColor Gray
@@ -353,20 +396,6 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "  ✓ Website Contributor assigned on Logic App" -ForegroundColor Green
 } else {
     Write-Host "  ⚠ Website Contributor assignment may already exist" -ForegroundColor Yellow
-}
-
-# Log Analytics Reader on source workspace
-Write-Host "  Assigning Log Analytics Reader on source workspace..." -ForegroundColor Gray
-az role assignment create `
-    --assignee $userManagedIdentityPrincipalId `
-    --role "Log Analytics Reader" `
-    --scope "/subscriptions/$subscription/resourceGroups/$SourceWorkspaceResourceGroup/providers/Microsoft.OperationalInsights/workspaces/$SourceLogAnalyticsWorkspace" `
-    --output none 2>$null
-
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  ✓ Log Analytics Reader assigned on source workspace" -ForegroundColor Green
-} else {
-    Write-Host "  ⚠ Log Analytics Reader assignment may already exist" -ForegroundColor Yellow
 }
 
 # Reader on source workspace for resource metadata access
@@ -387,7 +416,37 @@ Write-Host "✓ RBAC roles assigned" -ForegroundColor Green
 Write-Host "  Waiting 30 seconds for RBAC permissions to propagate..." -ForegroundColor Gray
 Start-Sleep -Seconds 30
 
-Write-Host "`nStep 6: Staging workflow and connections for deployment..." -ForegroundColor Cyan
+Write-Host "`nStep 7: Building and deploying CsvToParquet Function App..." -ForegroundColor Cyan
+
+# Build the .NET 10 isolated function (use the validated dotnet path from startup check)
+Write-Host "  Building ZipCsvFunction..." -ForegroundColor Gray
+$zipCsvProjectPath = Join-Path $PSScriptRoot "ZipCsvFunction\ZipCsvFunction.csproj"
+$zipCsvPublishPath = Join-Path $PSScriptRoot "ZipCsvFunction\publish"
+& $script:DotNetExe publish $zipCsvProjectPath -c Release -o $zipCsvPublishPath --nologo
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: dotnet publish failed for ZipCsvFunction" -ForegroundColor Red
+    exit 1
+}
+
+# Package and deploy via zip
+$zipPackagePath = Join-Path $env:TEMP "ZipCsvFunction.zip"
+Compress-Archive -Path (Join-Path $zipCsvPublishPath "*") -DestinationPath $zipPackagePath -Force
+Write-Host "  Deploying to Function App: $zipFunctionAppName..." -ForegroundColor Gray
+# Use 'az functionapp deploy' (newer /api/publish endpoint) instead of config-zip to avoid
+# the legacy Kudu Ninject DI crash that occurs with the old /api/zipdeploy endpoint.
+az functionapp deploy `
+    --name $zipFunctionAppName `
+    --resource-group $ResourceGroupName `
+    --src-path $zipPackagePath `
+    --type zip `
+    --output none
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ERROR: Zip CSV Function App deployment failed" -ForegroundColor Red
+    exit 1
+}
+Write-Host "✓ CsvToParquet Function deployed (blob trigger for CSV to Parquet conversion)" -ForegroundColor Green
+
+Write-Host "`nStep 8: Staging workflow and connections for deployment..." -ForegroundColor Cyan
 
 # Check if Azure Functions Core Tools is installed
 $funcVersion = func --version 2>&1
@@ -449,7 +508,7 @@ try {
         }
     } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $tempDeployDir "local.settings.json") -Encoding UTF8
 
-    Write-Host "`nStep 7: Deploying workflow to Logic App..." -ForegroundColor Cyan
+    Write-Host "`nStep 9: Deploying workflow to Logic App..." -ForegroundColor Cyan
     Set-Location $tempDeployDir
     Write-Host "  Publishing to Logic App: $LogicAppName..." -ForegroundColor Gray
     $publishOutput = func azure functionapp publish $LogicAppName 2>&1
@@ -467,7 +526,7 @@ try {
 }
 if (-not $deploySucceeded) { exit 1 }
 
-Write-Host "`nStep 8: Restarting Logic App to apply permissions..." -ForegroundColor Cyan
+Write-Host "`nStep 10: Restarting Logic App to apply permissions..." -ForegroundColor Cyan
 Write-Host "  This ensures all RBAC permissions and identity tokens are refreshed" -ForegroundColor Gray
 az logicapp restart --name $LogicAppName --resource-group $ResourceGroupName --output none
 Write-Host "✓ Logic App restarted" -ForegroundColor Green
@@ -480,17 +539,21 @@ Write-Host "  User Managed Identity: $userManagedIdentityName" -ForegroundColor 
 Write-Host "  User Managed Identity Principal ID: $userManagedIdentityPrincipalId" -ForegroundColor White
 Write-Host "  Logic App Storage: $logicAppStorageAccountName" -ForegroundColor White
 Write-Host "  Report Storage: $reportStorageAccountName" -ForegroundColor White
+Write-Host "  Zip CSV Function App: $zipFunctionAppName" -ForegroundColor White
 Write-Host "  Error Workspace: $errorWorkspaceName" -ForegroundColor White
 Write-Host ""
 Write-Host "RBAC Assignments:" -ForegroundColor Cyan
 Write-Host "  ✓ Website Contributor on Logic App (for dynamic schema)" -ForegroundColor White
 Write-Host "  ✓ Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
-Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace" -ForegroundColor White
+Write-Host "  ✓ Log Analytics Reader on source workspace $SourceLogAnalyticsWorkspace (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Storage Blob Data Contributor on $reportStorageAccountName (via Bicep)" -ForegroundColor White
+Write-Host "  ✓ Storage Blob Data Contributor for Function App (via Bicep)" -ForegroundColor White
 Write-Host "  ✓ Monitoring Metrics Publisher on DCR/DCE (via Bicep)" -ForegroundColor White
 Write-Host ""
 Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Verify workflow in Azure Portal: https://portal.azure.com/#resource/subscriptions/$subscription/resourceGroups/$ResourceGroupName/providers/Microsoft.Web/sites/$LogicAppName" -ForegroundColor White
-Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/dailyChargeBackReport.csv" -ForegroundColor White
+Write-Host "  2. Check report output in storage: $reportStorageAccountName/reportoutput/" -ForegroundColor White
+Write-Host "     - Logic App writes: chargeBack-daily-*.csv" -ForegroundColor Gray
+Write-Host "     - Blob trigger fires Function to create: chargeBack-daily-*.parquet" -ForegroundColor Gray
 Write-Host "  3. Monitor errors in workspace: $errorWorkspaceName (table: WorkflowFailures_CL)" -ForegroundColor White
 Write-Host ""
