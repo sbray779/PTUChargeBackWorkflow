@@ -5,7 +5,7 @@ This repository contains an automated deployment solution for an Azure Logic App
 It is assumed that there is an existing APIM instance being used as an AI Gateway and that LLM logging has been enabled on desired APIs which are sending prompt/response logs to an existing Log Analytics workspace. This solution is designed to do the following:
 
 1. Query the target Log Analytics workspace and summarize token utilization by product/subscription
-2. Summarize the data into CSV format
+2. Summarize the data into Parquet format
 3. Send the data to blob storage for later retrieval
 
 By default, the workflow is triggered every 24 hours.
